@@ -1,0 +1,2399 @@
+openapi: 3.0.3
+info:
+  title: WARD TWIN Pilot API
+  version: 1.0.0-draft
+  description: Proposed API contract for one Python/FastAPI service, PostgreSQL storage
+    and OutSystems ODC screens. Contract only; no running backend is included. Numeric
+    examples are synthetic, not validated clinical thresholds. See api-spec-th.html
+    for authorization, ingestion, model-time and CSV rules.
+servers:
+- url: http://localhost:8000/api/v1
+  description: Local development; use HTTPS in hosted environments
+security:
+- UserBearer: []
+tags:
+- name: Screens
+- name: Observations
+- name: Workflow
+- name: Agent
+- name: Imports
+- name: Operations
+paths:
+  /observations:
+    post:
+      operationId: ingestObservations
+      summary: รับค่าวัดจากเกตเวย์หรือพยาบาล
+      tags:
+      - Observations
+      description: GatewayKey permits source=iot and only heart_rate/respiratory_rate/spo2
+        from its allowed devices. UserBearer permits source=manual in an authorized
+        ward. A reading is identified by (authenticated producer_id, reading_id).
+        Exact retries are no-ops; changed content is 409. Validate the whole batch,
+        then commit atomically. Reject unmapped/ambiguous device assignments (409),
+        naive timestamps, duplicate metrics, unknown fields and measured_at > server
+        now+5 minutes (422). Late measurements are stored with their own measured_at
+        and server received_at; they cannot rewrite a historical prediction. Maximum
+        decoded body 1 MiB.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservationReceipt'
+              example:
+                inserted_readings: 1
+                duplicate_readings: 0
+                received_at: '2026-10-22T23:09:02Z'
+                items:
+                - reading_id: 11111111-1111-4111-8111-111111111111
+                  encounter_id: ENC-001
+                  result: inserted
+                prediction_processing: pending
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '409':
+          $ref: '#/components/responses/409'
+        '413':
+          $ref: '#/components/responses/413'
+        '415':
+          $ref: '#/components/responses/415'
+        '422':
+          $ref: '#/components/responses/422'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ObservationBatch'
+            examples:
+              iot-request:
+                value:
+                  source: iot
+                  readings:
+                  - reading_id: 11111111-1111-4111-8111-111111111111
+                    device_id: MON-01
+                    measured_at: '2026-10-22T23:09:00Z'
+                    measurements:
+                    - metric: heart_rate
+                      value: 108
+                      unit: bpm
+                    - metric: respiratory_rate
+                      value: 24
+                      unit: breaths/min
+                    - metric: spo2
+                      value: 94
+                      unit: '%'
+              manual-request:
+                value:
+                  source: manual
+                  readings:
+                  - reading_id: 22222222-2222-4222-8222-222222222222
+                    encounter_id: ENC-001
+                    measured_at: '2026-10-22T22:45:00Z'
+                    measurements:
+                    - metric: systolic_bp
+                      value: 106
+                      unit: mmHg
+                    - metric: diastolic_bp
+                      value: 68
+                      unit: mmHg
+      security:
+      - GatewayKey: []
+      - UserBearer: []
+      x-mvp-required: true
+  /wards/{ward_id}/patients:
+    get:
+      operationId: getWardPatients
+      summary: อ่านภาพรวมวอร์ด
+      tags:
+      - Screens
+      description: 'Active encounters only. Stable priority: unacknowledged+unassigned;
+        other unacknowledged; awaiting_assessment; data_issue; remaining. Break ties
+        by alert creation time then encounter_id. Use one DB read transaction for
+        snapshot/counts. Search is literal (not regex) over name, HN and bed. Role
+        nurse/admin and ward membership required.'
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WardPage'
+              example:
+                snapshot_at: '2026-10-22T23:10:00Z'
+                ward_id: WARD-A
+                counts:
+                  total_patients: 6
+                  unacknowledged: 2
+                  awaiting_assessment: 1
+                  data_issue: 1
+                items:
+                - encounter:
+                    encounter_id: ENC-004
+                    an: DEMO-2026-004
+                    ward_id: WARD-A
+                    bed_label: A-04
+                    admitted_at: '2026-10-21T07:00:00Z'
+                    patient:
+                      patient_id: PAT-004
+                      hn: DEMO-004
+                      display_name: นายทดสอบ คนที่สี่
+                      birth_date: '1956-02-20'
+                      sex: male
+                      allergy_status: unknown
+                  workflow:
+                    status: unacknowledged
+                    owner_id: null
+                    owner_display_name: null
+                  data_quality:
+                    status: fresh
+                    last_iot_received_at: '2026-10-22T23:09:02Z'
+                    issues: []
+                    freshness_policy_version: pilot-policy-001
+                  risk:
+                    status: ready
+                    probability: 0.34
+                    as_of: '2026-10-22T23:09:02Z'
+                    assessed_at: '2026-10-22T23:09:03Z'
+                    prediction_window_end: '2026-10-23T05:09:02Z'
+                    horizon_hours: 6
+                    model_version: xgb-pilot-001
+                    unavailable_reason: null
+                  latest_heart_rate: 112
+                  latest_spo2: 93
+                  latest_measured_at: '2026-10-22T23:09:00Z'
+                - encounter:
+                    encounter_id: ENC-001
+                    an: DEMO-2026-001
+                    ward_id: WARD-A
+                    bed_label: A-12
+                    admitted_at: '2026-10-22T07:00:00Z'
+                    patient:
+                      patient_id: PAT-001
+                      hn: DEMO-001
+                      display_name: นางตัวอย่าง ทดสอบ
+                      birth_date: '1959-06-14'
+                      sex: female
+                      allergy_status: unknown
+                  workflow:
+                    status: unacknowledged
+                    owner_id: NURSE-A
+                    owner_display_name: พยาบาลเวร A
+                  data_quality:
+                    status: fresh
+                    last_iot_received_at: '2026-10-22T23:09:02Z'
+                    issues: []
+                    freshness_policy_version: pilot-policy-001
+                  risk:
+                    status: ready
+                    probability: 0.28
+                    as_of: '2026-10-22T23:09:02Z'
+                    assessed_at: '2026-10-22T23:09:03Z'
+                    prediction_window_end: '2026-10-23T05:09:02Z'
+                    horizon_hours: 6
+                    model_version: xgb-pilot-001
+                    unavailable_reason: null
+                  latest_heart_rate: 108
+                  latest_spo2: 94
+                  latest_measured_at: '2026-10-22T23:09:00Z'
+                - encounter:
+                    encounter_id: ENC-003
+                    an: DEMO-2026-003
+                    ward_id: WARD-A
+                    bed_label: A-08
+                    admitted_at: '2026-10-21T07:00:00Z'
+                    patient:
+                      patient_id: PAT-003
+                      hn: DEMO-003
+                      display_name: นายทดสอบ คนที่สาม
+                      birth_date: '1962-04-05'
+                      sex: male
+                      allergy_status: unknown
+                  workflow:
+                    status: awaiting_assessment
+                    owner_id: NURSE-B
+                    owner_display_name: พยาบาลเวร B
+                  data_quality:
+                    status: fresh
+                    last_iot_received_at: '2026-10-22T23:09:02Z'
+                    issues: []
+                    freshness_policy_version: pilot-policy-001
+                  risk:
+                    status: ready
+                    probability: 0.31
+                    as_of: '2026-10-22T23:09:02Z'
+                    assessed_at: '2026-10-22T23:09:03Z'
+                    prediction_window_end: '2026-10-23T05:09:02Z'
+                    horizon_hours: 6
+                    model_version: xgb-pilot-001
+                    unavailable_reason: null
+                  latest_heart_rate: 104
+                  latest_spo2: 95
+                  latest_measured_at: '2026-10-22T23:09:00Z'
+                - encounter:
+                    encounter_id: ENC-002
+                    an: DEMO-2026-002
+                    ward_id: WARD-A
+                    bed_label: A-06
+                    admitted_at: '2026-10-22T07:00:00Z'
+                    patient:
+                      patient_id: PAT-002
+                      hn: DEMO-002
+                      display_name: นางทดสอบ คนที่สอง
+                      birth_date: '1966-07-10'
+                      sex: female
+                      allergy_status: unknown
+                  workflow:
+                    status: none
+                    owner_id: NURSE-A
+                    owner_display_name: พยาบาลเวร A
+                  data_quality:
+                    status: stale
+                    last_iot_received_at: '2026-10-22T22:58:02Z'
+                    issues:
+                    - iot_stale
+                    freshness_policy_version: pilot-policy-001
+                  risk:
+                    status: unavailable
+                    probability: null
+                    as_of: null
+                    assessed_at: null
+                    prediction_window_end: null
+                    horizon_hours: 6
+                    model_version: null
+                    unavailable_reason: stale_data
+                  latest_heart_rate: null
+                  latest_spo2: null
+                  latest_measured_at: null
+                - encounter:
+                    encounter_id: ENC-005
+                    an: DEMO-2026-005
+                    ward_id: WARD-A
+                    bed_label: A-15
+                    admitted_at: '2026-10-22T07:00:00Z'
+                    patient:
+                      patient_id: PAT-005
+                      hn: DEMO-005
+                      display_name: นางทดสอบ คนที่ห้า
+                      birth_date: '1968-01-15'
+                      sex: female
+                      allergy_status: unknown
+                  workflow:
+                    status: none
+                    owner_id: NURSE-B
+                    owner_display_name: พยาบาลเวร B
+                  data_quality:
+                    status: fresh
+                    last_iot_received_at: '2026-10-22T23:09:02Z'
+                    issues: []
+                    freshness_policy_version: pilot-policy-001
+                  risk:
+                    status: ready
+                    probability: 0.15
+                    as_of: '2026-10-22T23:09:02Z'
+                    assessed_at: '2026-10-22T23:09:03Z'
+                    prediction_window_end: '2026-10-23T05:09:02Z'
+                    horizon_hours: 6
+                    model_version: xgb-pilot-001
+                    unavailable_reason: null
+                  latest_heart_rate: 84
+                  latest_spo2: 97
+                  latest_measured_at: '2026-10-22T23:09:00Z'
+                - encounter:
+                    encounter_id: ENC-006
+                    an: DEMO-2026-006
+                    ward_id: WARD-A
+                    bed_label: A-18
+                    admitted_at: '2026-10-22T07:00:00Z'
+                    patient:
+                      patient_id: PAT-006
+                      hn: DEMO-006
+                      display_name: นายทดสอบ คนที่หก
+                      birth_date: '1970-03-02'
+                      sex: male
+                      allergy_status: unknown
+                  workflow:
+                    status: none
+                    owner_id: NURSE-A
+                    owner_display_name: พยาบาลเวร A
+                  data_quality:
+                    status: fresh
+                    last_iot_received_at: '2026-10-22T23:09:02Z'
+                    issues: []
+                    freshness_policy_version: pilot-policy-001
+                  risk:
+                    status: ready
+                    probability: 0.08
+                    as_of: '2026-10-22T23:09:02Z'
+                    assessed_at: '2026-10-22T23:09:03Z'
+                    prediction_window_end: '2026-10-23T05:09:02Z'
+                    horizon_hours: 6
+                    model_version: xgb-pilot-001
+                    unavailable_reason: null
+                  latest_heart_rate: 76
+                  latest_spo2: 98
+                  latest_measured_at: '2026-10-22T23:09:00Z'
+                total_matching: 6
+                limit: 50
+                offset: 0
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '422':
+          $ref: '#/components/responses/422'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+      parameters:
+      - name: ward_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      - name: filter
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - all
+          - unacknowledged
+          - awaiting_assessment
+          - data_issue
+          default: all
+      - name: q
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 100
+      - &id001
+        name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 50
+      - &id002
+        name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+      x-mvp-required: true
+  /encounters/{encounter_id}/twin:
+    get:
+      operationId: getPatientTwin
+      summary: อ่าน Digital Twin รายผู้ป่วย
+      tags:
+      - Screens
+      description: One screen payload. Snapshot is server time; measurement and risk
+        times stay separate. Derive freshness at read time so an old ready score is
+        never presented as current. Internal modules compute features and inference;
+        the UI does not submit probabilities. Nurse/admin, ward-scoped.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Twin'
+              example:
+                snapshot_at: '2026-10-22T23:10:00Z'
+                encounter:
+                  encounter_id: ENC-001
+                  an: DEMO-2026-001
+                  ward_id: WARD-A
+                  bed_label: A-12
+                  admitted_at: '2026-10-22T07:00:00Z'
+                  patient:
+                    patient_id: PAT-001
+                    hn: DEMO-001
+                    display_name: นางตัวอย่าง ทดสอบ
+                    birth_date: '1959-06-14'
+                    sex: female
+                    allergy_status: unknown
+                workflow: &id006
+                  status: unacknowledged
+                  owner_id: NURSE-A
+                  owner_display_name: พยาบาลเวร A
+                data_quality: &id003
+                  status: fresh
+                  last_iot_received_at: '2026-10-22T23:09:02Z'
+                  issues: []
+                  freshness_policy_version: pilot-policy-001
+                vitals: &id004
+                - metric: heart_rate
+                  value: 108
+                  unit: bpm
+                  measured_at: '2026-10-22T23:09:00Z'
+                  received_at: '2026-10-22T23:09:02Z'
+                  source: iot
+                  data_status: fresh
+                  reading_id: 11111111-1111-4111-8111-111111111111
+                - metric: respiratory_rate
+                  value: 24
+                  unit: breaths/min
+                  measured_at: '2026-10-22T23:09:00Z'
+                  received_at: '2026-10-22T23:09:02Z'
+                  source: iot
+                  data_status: fresh
+                  reading_id: 11111111-1111-4111-8111-111111111111
+                - metric: spo2
+                  value: 94
+                  unit: '%'
+                  measured_at: '2026-10-22T23:09:00Z'
+                  received_at: '2026-10-22T23:09:02Z'
+                  source: iot
+                  data_status: fresh
+                  reading_id: 11111111-1111-4111-8111-111111111111
+                - metric: systolic_bp
+                  value: 106
+                  unit: mmHg
+                  measured_at: '2026-10-22T22:45:00Z'
+                  received_at: '2026-10-22T22:45:02Z'
+                  source: manual
+                  data_status: fresh
+                  reading_id: 22222222-2222-4222-8222-222222222222
+                - metric: diastolic_bp
+                  value: 68
+                  unit: mmHg
+                  measured_at: '2026-10-22T22:45:00Z'
+                  received_at: '2026-10-22T22:45:02Z'
+                  source: manual
+                  data_status: fresh
+                  reading_id: 22222222-2222-4222-8222-222222222222
+                - metric: temperature
+                  value: 38.2
+                  unit: Cel
+                  measured_at: '2026-10-22T23:00:00Z'
+                  received_at: '2026-10-22T23:00:02Z'
+                  source: manual
+                  data_status: fresh
+                  reading_id: 55555555-5555-4555-8555-555555555555
+                risk: &id005
+                  status: ready
+                  probability: 0.28
+                  as_of: '2026-10-22T23:09:02Z'
+                  assessed_at: '2026-10-22T23:09:03Z'
+                  prediction_window_end: '2026-10-23T05:09:02Z'
+                  horizon_hours: 6
+                  model_version: xgb-pilot-001
+                  unavailable_reason: null
+                open_alert:
+                  alert_id: ALT-001
+                  encounter_id: ENC-001
+                  state: open
+                  created_at: '2026-10-22T23:09:03Z'
+                  trigger_probability: 0.28
+                  trigger_threshold: 0.25
+                  model_version: xgb-pilot-001
+                  assigned_to: NURSE-A
+                  acknowledgement: null
+                recent_assessments: []
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+      parameters:
+      - name: encounter_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      x-mvp-required: true
+  /encounters/{encounter_id}/observations:
+    get:
+      operationId: getObservations
+      summary: อ่านจุดข้อมูลสำหรับกราฟ
+      tags:
+      - Observations
+      description: Required start/end RFC3339. end > start, range <=24h; default limit
+        500, max1000. after must belong to this encounter, metric and time range;
+        mismatched cursor is 422. Cursor preserves a fixed received_at upper bound
+        from the first page so later arrivals do not reorder pagination. No cross-patient
+        access.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservationPage'
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '422':
+          $ref: '#/components/responses/422'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+      parameters:
+      - name: encounter_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      - name: metric
+        in: query
+        required: true
+        schema:
+          type: string
+          enum:
+          - heart_rate
+          - respiratory_rate
+          - spo2
+          - systolic_bp
+          - diastolic_bp
+          - temperature
+      - name: start
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+      - name: end
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 500
+          minimum: 1
+          maximum: 1000
+      - name: after
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 1000
+      x-mvp-required: true
+  /encounters/{encounter_id}/alerts:
+    get:
+      operationId: getAlerts
+      summary: อ่านรายการเหตุเตือน
+      tags:
+      - Workflow
+      description: Optional extension; not required for the MVP. Newest first, stable
+        by created_at and alert_id. Nurse/admin in the encounter ward. This prototype
+        has no public close-alert endpoint.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertPage'
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '422':
+          $ref: '#/components/responses/422'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+      parameters:
+      - name: encounter_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      - name: state
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - open
+          - closed
+          - all
+          default: open
+      - *id001
+      - *id002
+      x-mvp-required: false
+  /alerts/{alert_id}/acknowledgement:
+    put:
+      operationId: acknowledgeAlert
+      summary: รับงานและรับทราบเหตุเตือน
+      tags:
+      - Workflow
+      description: No request body. Derive actor from verified user token. Requires
+        an open alert and authorized ward. If unassigned, atomically assign to actor
+        and acknowledge. If assigned, only the assignee or an authorized ward admin
+        can acknowledge. First call 201; exact repeat by same actor 200 preserving
+        timestamp. Concurrent acknowledgement by a different actor or closed alert
+        is 409. Does not close the alert.
+      responses:
+        '201':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Acknowledgement'
+              example:
+                alert_id: ALT-001
+                acknowledged_at: '2026-10-22T23:10:00Z'
+                acknowledged_by: NURSE-A
+                assigned_to: NURSE-A
+          headers:
+            Location:
+              schema:
+                type: string
+              description: Relative URI of this acknowledgement resource.
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '409':
+          $ref: '#/components/responses/409'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+        '200':
+          description: Already acknowledged by the same actor; original representation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Acknowledgement'
+      parameters:
+      - name: alert_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      x-mvp-required: true
+  /encounters/{encounter_id}/assessments:
+    post:
+      operationId: createAssessment
+      summary: เพิ่มบันทึกการประเมิน
+      tags:
+      - Workflow
+      description: Server derives created_by/time. client_record_id is unique per
+        actor. Same ID+content replay returns 200 with the original record; different
+        content is 409. alert_id, if present, must belong to the encounter (422).
+        Each new client_record_id appends an immutable assessment; no edit/revision
+        API in the MVP. Assessment does not acknowledge or close an alert. Note linked
+        to an acknowledged open alert changes workflow to assessed_open.
+      responses:
+        '201':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Assessment'
+              example:
+                assessment_id: ASM-001
+                encounter_id: ENC-001
+                client_record_id: 33333333-3333-4333-8333-333333333333
+                alert_id: ALT-001
+                note: บันทึกตัวอย่างการประเมินผู้ป่วย
+                created_at: '2026-10-22T23:10:00Z'
+                created_by: NURSE-A
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '409':
+          $ref: '#/components/responses/409'
+        '413':
+          $ref: '#/components/responses/413'
+        '415':
+          $ref: '#/components/responses/415'
+        '422':
+          $ref: '#/components/responses/422'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+        '200':
+          description: Idempotent replay; original assessment
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Assessment'
+      parameters:
+      - name: encounter_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssessmentInput'
+            example:
+              client_record_id: 33333333-3333-4333-8333-333333333333
+              alert_id: ALT-001
+              note: บันทึกตัวอย่างการประเมินผู้ป่วย
+      x-mvp-required: true
+    get:
+      operationId: getAssessments
+      summary: อ่านประวัติการประเมิน
+      tags:
+      - Workflow
+      description: Optional extension; not required for the MVP. Newest first by created_at
+        and assessment_id, including prior revisions. Nurse/admin, ward-scoped.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssessmentPage'
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '422':
+          $ref: '#/components/responses/422'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+      parameters:
+      - name: encounter_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      - *id001
+      - *id002
+      x-mvp-required: false
+  /encounters/{encounter_id}/agent-context:
+    get:
+      operationId: getAgentContext
+      summary: อ่านบริบทแบบจำกัดสำหรับ AI Agent
+      tags:
+      - Agent
+      description: ODC Server Action passes a verifiable UserBearer for the requesting
+        clinician. Validate user ward access normally. The Agent tool is restricted
+        to this read-only endpoint; do not expose the bearer token to model text or
+        client-side code. Read-only and contains no instructions or write tools; model
+        inference and alerts never wait for this call. No endpoint in this backend
+        generates AI summaries.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentContext'
+              example:
+                encounter_id: ENC-001
+                snapshot_at: '2026-10-22T23:10:00Z'
+                age_years: 67
+                data_quality: *id003
+                vitals: *id004
+                risk: *id005
+                workflow: *id006
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+      parameters:
+      - name: encounter_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      security:
+      - UserBearer: []
+      x-mvp-required: true
+  /imports:
+    post:
+      operationId: previewCsvImport
+      summary: อัปโหลด CSV เพื่อตรวจและดูตัวอย่าง
+      tags:
+      - Imports
+      description: Admin in ward only. Always dry-run. multipart/form-data with kind,
+        ward_id and file; never write live readings/outcomes yet. Max file 2 MiB,
+        5000 data rows, UTF-8 with optional BOM, comma-separated, Headers on physical
+        row1, match the template set after trimming whitespace (column order may differ),
+        no duplicate/unknown columns. Ignore empty physical lines but validate delimiter-only
+        data rows. birth_date may be empty when unknown; preserve an already known
+        birth date. UUID reading_ids are case-insensitive. An existing reading_id
+        must be replayed with the exact complete metric set, never add/remove a metric.
+        Preserve fractional-second precision when comparing timestamps. Stage immutable
+        normalized rows in PostgreSQL with 24h expiry; no local-disk dependency on
+        Render. Return 201 even if CSV has invalid rows (state=invalid); unreadable/structurally
+        invalid CSV is 422. Preview max5 rows, errors max100 and report truncation.
+        Historical outcomes are isolated from inference.
+      responses:
+        '201':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportPreview'
+              example: &id007
+                import_id: IMP-001
+                kind: observations
+                ward_id: WARD-A
+                state: validated
+                total_rows: 1
+                insert_rows: 1
+                duplicate_rows: 0
+                invalid_rows: 0
+                error_count: 0
+                errors: []
+                errors_truncated: false
+                preview:
+                - reading_id: 44444444-4444-4444-8444-444444444444
+                  encounter_id: ENC-001
+                  measured_at: '2026-10-22T23:09:00Z'
+                  metric: heart_rate
+                  value: '108'
+                  unit: bpm
+                expires_at: '2026-10-23T23:10:00Z'
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '413':
+          $ref: '#/components/responses/413'
+        '415':
+          $ref: '#/components/responses/415'
+        '422':
+          $ref: '#/components/responses/422'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                kind:
+                  type: string
+                  enum:
+                  - encounters
+                  - observations
+                  - outcomes
+                ward_id:
+                  type: string
+                  minLength: 1
+                  maxLength: 64
+                  pattern: ^[A-Za-z0-9_-]+$
+                file:
+                  type: string
+                  format: binary
+              required:
+              - kind
+              - ward_id
+              - file
+      x-mvp-required: true
+  /imports/{import_id}:
+    get:
+      operationId: getImportPreview
+      summary: อ่านผลตรวจ CSV เดิม
+      tags:
+      - Imports
+      description: Optional extension; not required for the MVP. Only uploading admin
+        (and same ward); non-owner returns 404. Uncommitted previews expire in 24h
+        (410). Never expose a preview by guessing its ID.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportPreview'
+              example: *id007
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '410':
+          $ref: '#/components/responses/410'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+      parameters:
+      - name: import_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      x-mvp-required: false
+  /imports/{import_id}/commit:
+    post:
+      operationId: commitCsvImport
+      summary: ยืนยันนำเข้า CSV ที่ผ่านการตรวจ
+      tags:
+      - Imports
+      description: No request body. Only uploading admin. Revalidate references, permissions
+        and conflicts inside the same transaction and commit the exact staged rows
+        atomically. Invalid state or changed target data=409 with REVALIDATION_REQUIRED;
+        import again to preview a new draft. Expired draft=410. Never silently overwrite
+        differing existing data; identical duplicates are no-ops. Repeated commit
+        of an already committed import returns the original result. Outcomes only
+        enter the isolated offline table. New historical imports do not emit retrospective
+        live alerts.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportCommit'
+              example:
+                import_id: IMP-001
+                state: committed
+                inserted_rows: 1
+                duplicate_rows: 0
+                committed_at: '2026-10-22T23:11:00Z'
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '409':
+          $ref: '#/components/responses/409'
+        '410':
+          $ref: '#/components/responses/410'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+      parameters:
+      - name: import_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      x-mvp-required: true
+  /import-templates/{kind}:
+    get:
+      operationId: getCsvTemplate
+      summary: ดาวน์โหลดแม่แบบ CSV
+      tags:
+      - Imports
+      description: Optional extension; not required for the MVP. Admin only; return
+        CSV header and synthetic sample rows, UTF-8. Content-Disposition attachment.
+        Templates are versioned together with /api/v1.
+      responses:
+        '200':
+          description: Success
+          content:
+            text/csv:
+              schema:
+                type: string
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              example: attachment; filename="observations.csv"
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          $ref: '#/components/responses/403'
+        '422':
+          $ref: '#/components/responses/422'
+        '429':
+          $ref: '#/components/responses/429'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+      parameters:
+      - name: kind
+        in: path
+        required: true
+        schema:
+          type: string
+          enum:
+          - encounters
+          - observations
+          - outcomes
+      x-mvp-required: false
+  /healthz:
+    get:
+      operationId: getHealth
+      summary: ตรวจว่าโปรเซสยังตอบสนอง
+      tags:
+      - Operations
+      description: Liveness only, public, no database/model metadata or patient data.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '500':
+          $ref: '#/components/responses/500'
+      security: []
+      x-mvp-required: true
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: ตรวจฐานข้อมูลและโมเดลพร้อมใช้งาน
+      tags:
+      - Operations
+      description: Optional extension; not required for the MVP. Public coarse status
+        only. 200 when DB reachable and the approved local model artifact loaded;
+        otherwise 503 Problem without topology/credentials. Configure deployment health
+        checks according to the desired restart behavior.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+        '503':
+          $ref: '#/components/responses/503'
+        '500':
+          $ref: '#/components/responses/500'
+      security: []
+      x-mvp-required: false
+components:
+  schemas:
+    Problem:
+      type: object
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          example: about:blank
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        code:
+          type: string
+        request_id:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              path:
+                type: string
+              code:
+                type: string
+              message:
+                type: string
+            required:
+            - path
+            - code
+            - message
+      required:
+      - type
+      - title
+      - status
+      - detail
+      - code
+      - request_id
+    Measurement:
+      type: object
+      additionalProperties: false
+      properties:
+        metric:
+          type: string
+          enum:
+          - heart_rate
+          - respiratory_rate
+          - spo2
+          - systolic_bp
+          - diastolic_bp
+          - temperature
+        value:
+          type: number
+        unit:
+          type: string
+          enum:
+          - bpm
+          - breaths/min
+          - '%'
+          - mmHg
+          - Cel
+      required:
+      - metric
+      - value
+      - unit
+      description: Pair metric/unit using the canonical unit table. spo2 is between
+        0 and 100; all other values must be finite and >0. Each metric occurs at most
+        once per reading. These are format/physical checks, not clinical alert thresholds.
+    Reading:
+      type: object
+      additionalProperties: false
+      properties:
+        reading_id:
+          type: string
+          format: uuid
+        encounter_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        device_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        measured_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        measurements:
+          type: array
+          items:
+            $ref: '#/components/schemas/Measurement'
+          minItems: 1
+          maxItems: 6
+      required:
+      - reading_id
+      - measured_at
+      - measurements
+      description: iot requires device_id; encounter_id may be omitted and is resolved
+        from the device assignment at measured_at. If supplied it must match. manual
+        requires encounter_id and must omit device_id. Unknown fields are rejected.
+    ObservationBatch:
+      type: object
+      additionalProperties: false
+      properties:
+        source:
+          type: string
+          enum:
+          - iot
+          - manual
+        readings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Reading'
+          minItems: 1
+          maxItems: 100
+      required:
+      - source
+      - readings
+    ObservationReceipt:
+      type: object
+      additionalProperties: false
+      properties:
+        inserted_readings:
+          type: integer
+          minimum: 0
+        duplicate_readings:
+          type: integer
+          minimum: 0
+        received_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              reading_id:
+                type: string
+                format: uuid
+              encounter_id:
+                type: string
+                minLength: 1
+                maxLength: 64
+                pattern: ^[A-Za-z0-9_-]+$
+              result:
+                type: string
+                enum:
+                - inserted
+                - duplicate
+            required:
+            - reading_id
+            - encounter_id
+            - result
+        prediction_processing:
+          type: string
+          enum:
+          - pending
+          - unchanged
+      required:
+      - inserted_readings
+      - duplicate_readings
+      - received_at
+      - items
+      - prediction_processing
+      description: 200 means readings are durably committed, not that inference has
+        completed. All rows are checked before the single transaction commits.
+    PatientIdentity:
+      type: object
+      additionalProperties: false
+      properties:
+        patient_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        hn:
+          type: string
+        display_name:
+          type: string
+        birth_date:
+          type: string
+          format: date
+          nullable: true
+        sex:
+          type: string
+          enum:
+          - female
+          - male
+          - other
+          - unknown
+        allergy_status:
+          type: string
+          enum:
+          - unknown
+          - none_recorded
+          - recorded
+      required:
+      - patient_id
+      - hn
+      - display_name
+      - birth_date
+      - sex
+      - allergy_status
+    Encounter:
+      type: object
+      additionalProperties: false
+      properties:
+        encounter_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        an:
+          type: string
+        ward_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        bed_label:
+          type: string
+        admitted_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        patient:
+          $ref: '#/components/schemas/PatientIdentity'
+      required:
+      - encounter_id
+      - an
+      - ward_id
+      - bed_label
+      - admitted_at
+      - patient
+    Vital:
+      type: object
+      additionalProperties: false
+      properties:
+        reading_id:
+          type: string
+          format: uuid
+          nullable: true
+        metric:
+          type: string
+          enum:
+          - heart_rate
+          - respiratory_rate
+          - spo2
+          - systolic_bp
+          - diastolic_bp
+          - temperature
+        value:
+          type: number
+          nullable: true
+        unit:
+          type: string
+          enum:
+          - bpm
+          - breaths/min
+          - '%'
+          - mmHg
+          - Cel
+        measured_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+          nullable: true
+        received_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+          nullable: true
+        source:
+          type: string
+          enum:
+          - iot
+          - manual
+          - csv
+          - null
+          nullable: true
+        data_status:
+          type: string
+          enum:
+          - fresh
+          - stale
+          - missing
+          - suspect
+      required:
+      - reading_id
+      - metric
+      - value
+      - unit
+      - measured_at
+      - received_at
+      - source
+      - data_status
+      description: Missing values are null, never zero. A stale last value retains
+        its original measured_at and is labelled stale.
+    DataQuality:
+      type: object
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum:
+          - fresh
+          - stale
+          - insufficient
+        last_iot_received_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+          nullable: true
+        issues:
+          type: array
+          items:
+            type: string
+        freshness_policy_version:
+          type: string
+      required:
+      - status
+      - last_iot_received_at
+      - issues
+      - freshness_policy_version
+    Risk:
+      type: object
+      additionalProperties: false
+      properties:
+        as_of:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+          nullable: true
+        status:
+          type: string
+          enum:
+          - ready
+          - pending
+          - unavailable
+        probability:
+          type: number
+          minimum: 0
+          maximum: 1
+          nullable: true
+        assessed_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+          nullable: true
+        prediction_window_end:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+          nullable: true
+        horizon_hours:
+          type: integer
+          enum:
+          - 6
+        model_version:
+          type: string
+          nullable: true
+        unavailable_reason:
+          type: string
+          enum:
+          - stale_data
+          - missing_required_data
+          - model_unavailable
+          - processing
+          - null
+          nullable: true
+      required:
+      - as_of
+      - status
+      - probability
+      - assessed_at
+      - prediction_window_end
+      - horizon_hours
+      - model_version
+      - unavailable_reason
+      description: Only ready exposes a current probability. pending/unavailable must
+        return probability=null. ready requires prediction_window_end=as_of+6h, assessed_at>=as_of,
+        and a model_version; unavailable_reason is null when ready. 0.28 is 28%, not
+        28.
+    Acknowledgement:
+      type: object
+      additionalProperties: false
+      properties:
+        alert_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        acknowledged_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        acknowledged_by:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        assigned_to:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      required:
+      - alert_id
+      - acknowledged_at
+      - acknowledged_by
+      - assigned_to
+    Alert:
+      type: object
+      additionalProperties: false
+      properties: &id008
+        alert_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        encounter_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        state:
+          type: string
+          enum:
+          - open
+          - closed
+        created_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        trigger_probability:
+          type: number
+          minimum: 0
+          maximum: 1
+        trigger_threshold:
+          type: number
+          minimum: 0
+          maximum: 1
+        model_version:
+          type: string
+        assigned_to:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+          nullable: true
+        acknowledgement:
+          type: object
+          additionalProperties: false
+          properties:
+            acknowledged_at:
+              type: string
+              format: date-time
+              pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+              description: RFC 3339 with timezone, at most 6 fractional-second digits
+                (PostgreSQL/Python microsecond precision); responses use UTC Z. No
+                naive timestamps.
+            acknowledged_by:
+              type: string
+              minLength: 1
+              maxLength: 64
+              pattern: ^[A-Za-z0-9_-]+$
+          required:
+          - acknowledged_at
+          - acknowledged_by
+          nullable: true
+      required: &id009
+      - alert_id
+      - encounter_id
+      - state
+      - created_at
+      - trigger_probability
+      - trigger_threshold
+      - model_version
+      - assigned_to
+      - acknowledgement
+      description: trigger_probability is historical evidence at creation, not necessarily
+        the current risk. Acknowledge and assessment never close an alert.
+    AssessmentInput:
+      type: object
+      additionalProperties: false
+      properties:
+        client_record_id:
+          type: string
+          format: uuid
+        note:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        alert_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      required:
+      - client_record_id
+      - note
+      description: alert_id is optional but required for this note to count as an
+        assessment of that alert. Each submission appends a new assessment; existing
+        records stay immutable. Trim whitespace and reject an empty note.
+    Assessment:
+      type: object
+      additionalProperties: false
+      properties:
+        assessment_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        encounter_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        client_record_id:
+          type: string
+          format: uuid
+        alert_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+          nullable: true
+        note:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        created_by:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+      required:
+      - assessment_id
+      - encounter_id
+      - client_record_id
+      - alert_id
+      - note
+      - created_at
+      - created_by
+    Workflow:
+      type: object
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum:
+          - none
+          - unacknowledged
+          - awaiting_assessment
+          - assessed_open
+        owner_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+          nullable: true
+        owner_display_name:
+          type: string
+          nullable: true
+      required:
+      - status
+      - owner_id
+      - owner_display_name
+      description: Independent of data quality. unacknowledged wins over an existing
+        note until acknowledgement is recorded. assessed_open still has an open alert.
+    Twin:
+      type: object
+      additionalProperties: false
+      properties:
+        snapshot_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        encounter:
+          $ref: '#/components/schemas/Encounter'
+        workflow:
+          $ref: '#/components/schemas/Workflow'
+        data_quality:
+          $ref: '#/components/schemas/DataQuality'
+        vitals:
+          type: array
+          items:
+            $ref: '#/components/schemas/Vital'
+          minItems: 6
+          maxItems: 6
+        risk:
+          $ref: '#/components/schemas/Risk'
+        open_alert:
+          type: object
+          additionalProperties: false
+          properties: *id008
+          required: *id009
+          description: trigger_probability is historical evidence at creation, not
+            necessarily the current risk. Acknowledge and assessment never close an
+            alert.
+          nullable: true
+        recent_assessments:
+          type: array
+          items:
+            $ref: '#/components/schemas/Assessment'
+          maxItems: 10
+      required:
+      - snapshot_at
+      - encounter
+      - workflow
+      - data_quality
+      - vitals
+      - risk
+      - open_alert
+      - recent_assessments
+      description: Returns all first-screen information in one call. The six vital
+        entries use the canonical order. recent_assessments contains the latest 10;
+        no unlimited history or PHI in logs.
+    WardPatient:
+      type: object
+      additionalProperties: false
+      properties:
+        encounter:
+          $ref: '#/components/schemas/Encounter'
+        workflow:
+          $ref: '#/components/schemas/Workflow'
+        data_quality:
+          $ref: '#/components/schemas/DataQuality'
+        risk:
+          $ref: '#/components/schemas/Risk'
+        latest_heart_rate:
+          type: number
+          nullable: true
+        latest_spo2:
+          type: number
+          nullable: true
+        latest_measured_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+          nullable: true
+      required:
+      - encounter
+      - workflow
+      - data_quality
+      - risk
+      - latest_heart_rate
+      - latest_spo2
+      - latest_measured_at
+    WardPage:
+      type: object
+      additionalProperties: false
+      properties:
+        snapshot_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        ward_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        counts:
+          type: object
+          additionalProperties: false
+          properties:
+            total_patients:
+              type: integer
+              minimum: 0
+            unacknowledged:
+              type: integer
+              minimum: 0
+            awaiting_assessment:
+              type: integer
+              minimum: 0
+            data_issue:
+              type: integer
+              minimum: 0
+          required:
+          - total_patients
+          - unacknowledged
+          - awaiting_assessment
+          - data_issue
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WardPatient'
+          maxItems: 100
+        total_matching:
+          type: integer
+          minimum: 0
+        limit:
+          type: integer
+        offset:
+          type: integer
+      required:
+      - snapshot_at
+      - ward_id
+      - counts
+      - items
+      - total_matching
+      - limit
+      - offset
+      description: 'counts cover all active encounters in this authorized ward before
+        search/filter/pagination; items and total_matching apply filters. Counts may
+        overlap: a patient can have both an open alert and a data issue.'
+    ObservationPoint:
+      type: object
+      additionalProperties: false
+      properties:
+        reading_id:
+          type: string
+          format: uuid
+        metric:
+          type: string
+          enum:
+          - heart_rate
+          - respiratory_rate
+          - spo2
+          - systolic_bp
+          - diastolic_bp
+          - temperature
+        value:
+          type: number
+        unit:
+          type: string
+          enum:
+          - bpm
+          - breaths/min
+          - '%'
+          - mmHg
+          - Cel
+        measured_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        received_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        source:
+          type: string
+          enum:
+          - iot
+          - manual
+          - csv
+        quality:
+          type: string
+          enum:
+          - valid
+          - suspect
+      required:
+      - reading_id
+      - metric
+      - value
+      - unit
+      - measured_at
+      - received_at
+      - source
+      - quality
+    ObservationPage:
+      type: object
+      additionalProperties: false
+      properties:
+        encounter_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        metric:
+          type: string
+          enum:
+          - heart_rate
+          - respiratory_rate
+          - spo2
+          - systolic_bp
+          - diastolic_bp
+          - temperature
+        start:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        end:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObservationPoint'
+          maxItems: 1000
+        next_after:
+          type: string
+          nullable: true
+      required:
+      - encounter_id
+      - metric
+      - start
+      - end
+      - items
+      - next_after
+      description: Ascending by measured_at and reading_id; exact points, no invented
+        interpolation. [start,end). next_after is an opaque cursor; repeat the same
+        query with after until null.
+    AlertPage:
+      type: object
+      additionalProperties: false
+      properties:
+        encounter_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Alert'
+          maxItems: 100
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total_matching:
+          type: integer
+      required:
+      - encounter_id
+      - items
+      - limit
+      - offset
+      - total_matching
+    AssessmentPage:
+      type: object
+      additionalProperties: false
+      properties:
+        encounter_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Assessment'
+          maxItems: 100
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total_matching:
+          type: integer
+      required:
+      - encounter_id
+      - items
+      - limit
+      - offset
+      - total_matching
+    AgentContext:
+      type: object
+      additionalProperties: false
+      properties:
+        encounter_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        snapshot_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+        age_years:
+          type: integer
+          minimum: 0
+          nullable: true
+        data_quality:
+          $ref: '#/components/schemas/DataQuality'
+        vitals:
+          type: array
+          items:
+            $ref: '#/components/schemas/Vital'
+        risk:
+          $ref: '#/components/schemas/Risk'
+        workflow:
+          $ref: '#/components/schemas/Workflow'
+      required:
+      - encounter_id
+      - snapshot_at
+      - age_years
+      - data_quality
+      - vitals
+      - risk
+      - workflow
+      description: Read-only, minimal context for ODC Agent Workbench. No name, HN,
+        AN, historical outcomes, free-text notes, or tool instructions. Summarization
+        is run by ODC, not by this API.
+    ImportRowIssue:
+      type: object
+      additionalProperties: false
+      properties:
+        row:
+          type: integer
+          minimum: 1
+        column:
+          type: string
+        code:
+          type: string
+        message:
+          type: string
+      required:
+      - row
+      - column
+      - code
+      - message
+    ImportPreview:
+      type: object
+      additionalProperties: false
+      properties:
+        import_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        kind:
+          type: string
+          enum:
+          - encounters
+          - observations
+          - outcomes
+        ward_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        state:
+          type: string
+          enum:
+          - validated
+          - invalid
+          - committed
+        total_rows:
+          type: integer
+        insert_rows:
+          type: integer
+        duplicate_rows:
+          type: integer
+        invalid_rows:
+          type: integer
+        error_count:
+          type: integer
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImportRowIssue'
+          maxItems: 100
+        errors_truncated:
+          type: boolean
+        preview:
+          type: array
+          items:
+            type: object
+            additionalProperties:
+              type: string
+          maxItems: 5
+        expires_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+      required:
+      - import_id
+      - kind
+      - ward_id
+      - state
+      - total_rows
+      - insert_rows
+      - duplicate_rows
+      - invalid_rows
+      - error_count
+      - errors
+      - errors_truncated
+      - preview
+      - expires_at
+      description: Preview and errors are visible only to the importing admin. Row
+        1 is the CSV header. Total rows exclude the header. The uploaded file is an
+        immutable staged import, never committed merely by upload.
+    ImportCommit:
+      type: object
+      additionalProperties: false
+      properties:
+        import_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: ^[A-Za-z0-9_-]+$
+        state:
+          type: string
+          enum:
+          - committed
+        inserted_rows:
+          type: integer
+        duplicate_rows:
+          type: integer
+        committed_at:
+          type: string
+          format: date-time
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$
+          description: RFC 3339 with timezone, at most 6 fractional-second digits
+            (PostgreSQL/Python microsecond precision); responses use UTC Z. No naive
+            timestamps.
+      required:
+      - import_id
+      - state
+      - inserted_rows
+      - duplicate_rows
+      - committed_at
+      description: Atomic synchronous commit for the bounded file. Repeated commit
+        returns the original result and timestamp.
+    Health:
+      type: object
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+      required:
+      - status
+    Readiness:
+      type: object
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum:
+          - ready
+      required:
+      - status
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    '401':
+      description: Unauthorized
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    '403':
+      description: Forbidden
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    '409':
+      description: Conflict
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: about:blank
+            title: Conflict
+            status: 409
+            detail: The reading_id was already used with different content
+            code: DUPLICATE_CONTENT_MISMATCH
+            request_id: req-demo-002
+    '410':
+      description: Gone
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    '413':
+      description: Content Too Large
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    '415':
+      description: Unsupported Media Type
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    '422':
+      description: Unprocessable Content
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: about:blank
+            title: Unprocessable Content
+            status: 422
+            detail: metric/unit pair is invalid
+            code: VALIDATION_ERROR
+            request_id: req-demo-001
+            errors:
+            - path: body.readings.0.measurements.0.unit
+              code: UNIT_MISMATCH
+              message: heart_rate requires bpm
+    '429':
+      description: Too Many Requests
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 1
+          description: Seconds before retry; no automatic retries of 4xx except 429.
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    '503':
+      description: Service Unavailable
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 1
+          description: Seconds before retry; no automatic retries of 4xx except 429.
+  securitySchemes:
+    UserBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Existing trusted identity provider JWT. Verify signature, issuer,
+        audience, expiry and server-managed role/ward membership. ODC must pass a
+        verifiable user token; a shared API key is not user identity.
+    GatewayKey:
+      type: apiKey
+      in: header
+      name: X-Gateway-Key
+      description: Provisioned per gateway, stored hashed on backend; scopes producer/device/ward.
+        iot write only. Never browser code.
