@@ -1,0 +1,3 @@
+patient_id,hn,display_name,birth_date,sex,encounter_id,an,ward_id,bed_label,admitted_at
+PAT-CSV-012,HN-CSV-012,Patient A,1995-05-15,F,ENC-CSV-012,AN-CSV-012,WARD-TEST,TEST-12,2026-10-25T08:00:00Z
+PAT-CSV-013,HN-CSV-012,Patient B,1996-06-16,M,ENC-CSV-013,AN-CSV-013,WARD-TEST,TEST-13,2026-10-25T09:00:00Z

@@ -1,0 +1,2 @@
+patient_id,hn,display_name,birth_date,sex,encounter_id,an,ward_id,bed_label,admitted_at
+PAT-CSV-007,HN-CSV-007,Wrong Ward Test,1995-05-15,F,ENC-CSV-007,AN-CSV-007,WARD-OTHER,TEST-07,2026-10-25T08:00:00Z

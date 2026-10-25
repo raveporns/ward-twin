@@ -1,0 +1,2 @@
+patient_id,hn,display_name,birth_date,sex,encounter_id,an,ward_id,bed_label,admitted_at
+PAT-CSV-002,HN-CSV-002,Invalid Test Patient,1995-99-99,F,ENC-CSV-002,AN-CSV-002,WARD-TEST,TEST-03,2026-10-25T07:00:00Z

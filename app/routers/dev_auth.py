@@ -16,7 +16,7 @@ router = APIRouter(
 TEST_USERS = {
     "nurse-a": {
         "role": "nurse",
-        "wards": ["WARD-A"],
+        "wards": ["WARD-TEST"],
     },
     "nurse-b": {
         "role": "nurse",
@@ -24,7 +24,7 @@ TEST_USERS = {
     },
     "admin": {
         "role": "admin",
-        "wards": ["WARD-A", "WARD-B"],
+        "wards": ["WARD-A", "WARD-B", "WARD-TEST"],
     },
 }
 

@@ -1,0 +1,2 @@
+patient_id,hn,display_name,birth_date,sex,encounter_id,an,ward_id,bed_label,admitted_at
+PAT-CSV-018,HN-CSV-018,Existing AN Test,1995-05-15,F,ENC-CSV-018,AN-CSV-004,WARD-TEST,TEST-18,2026-10-25T08:00:00Z

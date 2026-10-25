@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     gateway_allowed_devices: str = "MON-01"
 
     database_url: str
+    db_schema: str = "ward_twin"
 
     model_config = SettingsConfigDict(
         env_file=".env",
