@@ -12,7 +12,6 @@ engine = create_engine(
     max_overflow=2,
     connect_args={
         "connect_timeout": 15,
-        "hostaddr": "3.106.102.114",  # ใช้ทดสอบชั่วคราว
         "options": f"-c search_path={settings.db_schema},public",
     },
 )

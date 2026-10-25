@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
-
 from sqlalchemy import text
 from app.core.database import SessionLocal
 
@@ -59,6 +58,7 @@ def claim_next_job():
 
 from app.services.prediction_processor import process_prediction
 from app.services.prediction_repository import save_prediction
+from app.services.alert_repository import create_alert_if_needed
 
 
 def run_once():
@@ -99,6 +99,13 @@ def run_once():
             result = process_prediction(db, encounter_id, as_of=now)
             prediction_id = save_prediction(db, result)
 
+            # สร้าง Alert เมื่อ Risk Score ถึง Threshold
+            alert_id = create_alert_if_needed(
+                db=db,
+                prediction_id=prediction_id,
+                result=result,
+            )
+
             # ไม่ข้าม version ใหม่ที่เข้ามาระหว่างประมวลผล
             db.execute(
                 text("""
@@ -131,6 +138,7 @@ def run_once():
                 "encounter_id": encounter_id,
                 "prediction_id": prediction_id,
                 "prediction_status": result["status"],
+                "alert_id": alert_id,
                 "claimed_version": claimed_version,
             }
 

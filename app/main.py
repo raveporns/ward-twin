@@ -2,7 +2,7 @@
 from fastapi import FastAPI
 
 from app.core.config import settings
-from app.routers import health, patients, observations, twin, observation_history, agent_context, readiness, import_templates, imports
+from app.routers import assessments, health, patients, observations, twin, observation_history, agent_context, readiness, import_templates, imports, alerts
 
 app = FastAPI(
     title="WARD TWIN Pilot API",
@@ -28,6 +28,10 @@ app.include_router(readiness.router, prefix="/api/v1")
 app.include_router(import_templates.router, prefix="/api/v1")
 
 app.include_router(imports.router, prefix="/api/v1")
+
+app.include_router(alerts.router, prefix="/api/v1")
+
+app.include_router(assessments.router, prefix="/api/v1")
 
 # Development Authentication
 if settings.app_env == "local":
