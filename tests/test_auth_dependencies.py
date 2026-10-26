@@ -9,6 +9,7 @@ from app.core.security import create_access_token, create_local_token
 from app.dependencies.auth import (
     resolve_user_identity,
     require_ward,
+    require_roles,
     get_observation_identity,
 )
 from app.core.config import settings
@@ -72,6 +73,25 @@ def test_ward_access_uses_database(mock_access):
     assert exc.value.status_code == 403
 
     assert require_ward("WARD-B", result) == result
+
+
+def test_require_roles_allows_matching_role():
+    user = {"role": "nurse"}
+
+    assert require_roles("admin", "nurse")(user=user) == user
+
+
+def test_require_roles_rejects_unmatched_role():
+    with pytest.raises(HTTPException) as exc:
+        require_roles("admin", "nurse")(user={"role": "viewer"})
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Role access denied"
+
+
+def test_require_roles_rejects_unknown_configured_role():
+    with pytest.raises(ValueError):
+        require_roles("gateway")
 
 
 @patch("app.dependencies.auth.get_active_user_access")

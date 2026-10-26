@@ -9,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.dependencies.auth import get_current_user, require_ward
+from app.dependencies.auth import require_roles, require_ward
 
 
 router = APIRouter(tags=["Digital Twin"])
@@ -118,8 +118,10 @@ def build_prediction(
             )
             else None
         ),
-        "prediction_id": serialize_value(
-            latest_prediction["prediction_id"]
+        "prediction_id": (
+        str(latest_prediction["prediction_id"])
+        if latest_prediction["prediction_id"] is not None
+        else None
         ),
         "model_version": latest_prediction["model_version"],
         "assessed_at": latest_prediction["assessed_at"],
@@ -163,7 +165,9 @@ def build_prediction(
 def get_patient_twin(
     encounter_id: str,
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(
+        require_roles("admin", "doctor", "nurse", "viewer")
+    ),
 ):
     # --------------------------------------------------------
     # 1. Get patient and encounter

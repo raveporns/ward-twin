@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.dependencies.auth import get_current_user, require_ward
+from app.dependencies.auth import require_roles, require_ward
 
 
 router = APIRouter(tags=["CSV Imports"])
@@ -105,7 +105,7 @@ class ImportDetailResponse(BaseModel):
     summary="Validate and stage encounters CSV",
     responses={
         401: {"description": "Authentication required"},
-        403: {"description": "Ward access denied"},
+        403: {"description": "Role or ward access denied"},
         413: {"description": "CSV exceeds 2 MB"},
         422: {"description": "Invalid CSV"},
     },
@@ -113,7 +113,7 @@ class ImportDetailResponse(BaseModel):
 async def create_import(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_roles("admin", "nurse")),
 ):
     # --------------------------------------------------------
     # Validate file
@@ -419,7 +419,7 @@ async def create_import(
     summary="Get staged import details",
     responses={
         401: {"description": "Authentication required"},
-        403: {"description": "Ward access denied"},
+        403: {"description": "Role or ward access denied"},
         404: {"description": "Import not found"},
         422: {"description": "Invalid import ID"},
     },
@@ -427,7 +427,7 @@ async def create_import(
 def get_import_detail(
     import_id: UUID,
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_roles("admin", "nurse")),
 ):
     # --------------------------------------------------------
     # Find import job
@@ -526,7 +526,7 @@ def get_import_detail(
     summary="Commit a validated encounters import",
     responses={
         401: {"description": "Authentication required"},
-        403: {"description": "Ward access denied"},
+        403: {"description": "Role or ward access denied"},
         404: {"description": "Import not found"},
         409: {"description": "Import cannot be committed"},
         422: {"description": "Invalid import ID"},
@@ -535,7 +535,7 @@ def get_import_detail(
 def commit_import(
     import_id: UUID,
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_roles("admin")),
 ):
     try:
         # ----------------------------------------------------

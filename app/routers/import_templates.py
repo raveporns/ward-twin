@@ -6,7 +6,7 @@ from enum import Enum
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response
 
-from app.dependencies.auth import get_current_user
+from app.dependencies.auth import require_roles
 
 
 router = APIRouter(tags=["Import Templates"])
@@ -46,6 +46,7 @@ TEMPLATES = {
     description=(
         "ดาวน์โหลดไฟล์ CSV Template สำหรับนำเข้าข้อมูล "
         "ปัจจุบันรองรับประเภท encounters เท่านั้น "
+        "อนุญาตเฉพาะผู้ใช้ Role admin หรือ nurse "
         "ผู้ใช้ต้องเข้าสู่ระบบด้วย Bearer JWT"
     ),
     response_class=Response,
@@ -65,7 +66,7 @@ TEMPLATES = {
             "description": "Authentication required",
         },
         403: {
-            "description": "User account inactive or access denied",
+            "description": "Account inactive or role access denied",
         },
         422: {
             "description": "Unsupported template kind",
@@ -74,7 +75,7 @@ TEMPLATES = {
 )
 def download_import_template(
     kind: ImportTemplateKind,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_roles("admin", "nurse")),
 ):
     columns = TEMPLATES.get(kind)
 

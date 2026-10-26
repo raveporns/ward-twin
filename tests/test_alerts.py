@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.core.database import get_db
 from app.core.security import create_local_token
+from app.dependencies.auth import get_current_user
 
 
 client = TestClient(app)
@@ -15,10 +16,10 @@ BASE = "/api/v1"
 ALERT_ID = "ALT-TEST-0009"
 
 
-def headers(wards=None):
+def headers(wards=None, role="nurse"):
     token = create_local_token(
         "nurseA1",
-        "nurse",
+        role,
         wards if wards is not None else ["WARD-A"],
     )
     return {"Authorization": f"Bearer {token}"}
@@ -76,13 +77,22 @@ def test_get_alerts_success(mock_db):
         }]),
     ]
 
-    response = client.get(
-        f"{BASE}/encounters/ENC-MOCK-A01/alerts",
-        headers=headers(),
-    )
+    app.dependency_overrides[get_current_user] = lambda: {
+        "sub": "viewerA1",
+        "role": "viewer",
+        "wards": ["WARD-A"],
+        "token_type": "access",
+    }
 
-    assert response.status_code == 200
-    assert response.json()["alerts"][0]["alert_id"] == ALERT_ID
+    try:
+        response = client.get(
+            f"{BASE}/encounters/ENC-MOCK-A01/alerts",
+        )
+
+        assert response.status_code == 200
+        assert response.json()["alerts"][0]["alert_id"] == ALERT_ID
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
 
 
 def test_acknowledge_success(mock_db):
@@ -143,6 +153,26 @@ def test_acknowledge_duplicate(mock_db):
     assert response.status_code == 409
     mock_db.commit.assert_not_called()
     mock_db.rollback.assert_called_once()
+
+
+def test_viewer_cannot_acknowledge_alert(mock_db):
+    app.dependency_overrides[get_current_user] = lambda: {
+        "sub": "viewerA1",
+        "role": "viewer",
+        "wards": ["WARD-A"],
+        "token_type": "access",
+    }
+
+    try:
+        response = client.put(
+            f"{BASE}/alerts/{ALERT_ID}/acknowledgement",
+            json={},
+        )
+
+        assert response.status_code == 403
+        mock_db.execute.assert_not_called()
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
 
 
 def test_acknowledge_wrong_ward(mock_db):

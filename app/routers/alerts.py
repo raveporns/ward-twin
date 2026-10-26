@@ -8,7 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.dependencies.auth import get_current_user, require_ward
+from app.dependencies.auth import require_roles, require_ward
 
 
 router = APIRouter(tags=["Alerts"])
@@ -64,13 +64,15 @@ class AlertAcknowledgementResponse(BaseModel):
 # Helpers
 # ============================================================
 
+
 def serialize_alert(row: dict) -> dict:
     """
-    Convert database values into JSON-compatible values.
+    Convert database values to API response types.
     """
 
     result = dict(row)
 
+    # Convert IDs to strings
     for key in (
         "alert_id",
         "encounter_id",
@@ -80,9 +82,10 @@ def serialize_alert(row: dict) -> dict:
     ):
         value = result.get(key)
 
-        if isinstance(value, UUID):
+        if value is not None:
             result[key] = str(value)
 
+    # Convert numeric values to floats
     for key in (
         "trigger_probability",
         "trigger_threshold",
@@ -165,7 +168,7 @@ def staff_exists(
             "description": "Authentication required",
         },
         403: {
-            "description": "Ward access denied",
+            "description": "Role or ward access denied",
         },
         404: {
             "description": "Encounter not found",
@@ -178,7 +181,9 @@ def staff_exists(
 def get_encounter_alerts(
     encounter_id: str,
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(
+        require_roles("admin", "doctor", "nurse", "viewer")
+    ),
 ):
     # --------------------------------------------------------
     # 1. Find encounter
@@ -262,7 +267,8 @@ def get_encounter_alerts(
     summary="Acknowledge Alert",
     description=(
         "บันทึกการรับทราบ Alert โดยเจ้าหน้าที่ที่มีสิทธิ์ "
-        "เข้าถึง Ward และมีข้อมูลใน staff_profiles "
+        "Role admin, doctor หรือ nurse ที่เข้าถึง Ward และมีข้อมูล "
+        "ใน staff_profiles "
         "ปัจจุบันรองรับเฉพาะการรับทราบด้วยตัวเอง"
     ),
     responses={
@@ -270,7 +276,7 @@ def get_encounter_alerts(
             "description": "Authentication required",
         },
         403: {
-            "description": "Ward access denied or user is not staff",
+            "description": "Role or ward access denied, or user is not staff",
         },
         404: {
             "description": "Alert not found",
@@ -287,7 +293,9 @@ def acknowledge_alert(
     alert_id: str,
     payload: AcknowledgementRequest,
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(
+        require_roles("admin", "doctor", "nurse")
+    ),
 ):
     try:
         # ----------------------------------------------------

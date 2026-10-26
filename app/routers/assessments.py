@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.dependencies.auth import get_current_user, require_ward
+from app.dependencies.auth import require_roles, require_ward
 
 
 router = APIRouter(tags=["Assessments"])
@@ -179,9 +179,10 @@ def get_existing_assessment(
     "/encounters/{encounter_id}/assessments",
     status_code=status.HTTP_201_CREATED,
     response_model=AssessmentResponse,
-    summary="Create Nurse Assessment",
+    summary="Create Assessment",
     description=(
-        "บันทึกผลการประเมินของพยาบาลสำหรับ Encounter "
+        "บันทึกผลการประเมินสำหรับ Encounter โดยผู้ใช้ Role "
+        "admin, doctor หรือ nurse "
         "รองรับการเชื่อมโยงกับ Alert และป้องกันข้อมูลซ้ำ "
         "ด้วย client_record_id"
     ),
@@ -190,7 +191,7 @@ def get_existing_assessment(
             "description": "Authentication required",
         },
         403: {
-            "description": "Ward access denied",
+            "description": "Role or ward access denied",
         },
         404: {
             "description": "Encounter or alert not found",
@@ -207,7 +208,9 @@ def create_assessment(
     encounter_id: str,
     payload: AssessmentCreate,
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(
+        require_roles("admin", "doctor", "nurse")
+    ),
 ):
     # --------------------------------------------------------
     # 1. Verify encounter and ward access
@@ -401,7 +404,7 @@ def create_assessment(
             "description": "Authentication required",
         },
         403: {
-            "description": "Ward access denied",
+            "description": "Role or ward access denied",
         },
         404: {
             "description": "Encounter not found",
@@ -414,7 +417,9 @@ def create_assessment(
 def get_assessments(
     encounter_id: str,
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(
+        require_roles("admin", "doctor", "nurse", "viewer")
+    ),
 ):
     # --------------------------------------------------------
     # 1. Verify encounter and ward access

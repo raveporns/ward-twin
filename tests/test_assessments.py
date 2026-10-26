@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.core.database import get_db
 from app.core.security import create_local_token
+from app.dependencies.auth import get_current_user
 
 
 client = TestClient(app)
@@ -17,10 +18,10 @@ ALERT = "ALT-TEST-0009"
 RECORD_ID = "c5c2e4e8-6a24-4b92-b5b1-872be8db1001"
 
 
-def headers(wards=None):
+def headers(wards=None, role="nurse"):
     token = create_local_token(
         "nurseA1",
-        "nurse",
+        role,
         wards if wards is not None else ["WARD-A"],
     )
     return {"Authorization": f"Bearer {token}"}
@@ -111,6 +112,26 @@ def test_create_assessment_success(mock_db):
     mock_db.commit.assert_called_once()
 
 
+def test_viewer_cannot_create_assessment(mock_db):
+    app.dependency_overrides[get_current_user] = lambda: {
+        "sub": "viewerA1",
+        "role": "viewer",
+        "wards": ["WARD-A"],
+        "token_type": "access",
+    }
+
+    try:
+        response = client.post(
+            f"{BASE}/encounters/{ENCOUNTER}/assessments",
+            json=payload(),
+        )
+
+        assert response.status_code == 403
+        mock_db.execute.assert_not_called()
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
 def test_create_assessment_idempotent(mock_db):
     mock_db.execute.side_effect = [
         query_result(one={"encounter_id": ENCOUNTER, "ward_id": "WARD-A"}),
@@ -150,13 +171,22 @@ def test_get_assessments_success(mock_db):
         query_result(all_rows=[stored_row()]),
     ]
 
-    response = client.get(
-        f"{BASE}/encounters/{ENCOUNTER}/assessments",
-        headers=headers(),
-    )
+    app.dependency_overrides[get_current_user] = lambda: {
+        "sub": "viewerA1",
+        "role": "viewer",
+        "wards": ["WARD-A"],
+        "token_type": "access",
+    }
 
-    assert response.status_code == 200
-    assert len(response.json()["assessments"]) == 1
+    try:
+        response = client.get(
+            f"{BASE}/encounters/{ENCOUNTER}/assessments",
+        )
+
+        assert response.status_code == 200
+        assert len(response.json()["assessments"]) == 1
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
 
 
 def test_get_assessments_wrong_ward(mock_db):

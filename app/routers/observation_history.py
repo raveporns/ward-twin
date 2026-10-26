@@ -6,7 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.dependencies.auth import get_current_user, require_ward
+from app.dependencies.auth import require_roles, require_ward
 
 router = APIRouter(tags=["Observation History"])
 
@@ -17,7 +17,9 @@ def get_observation_history(
     limit: int = Query(default=100, ge=1, le=500),
     before: datetime | None = Query(default=None),
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(
+        require_roles("admin", "doctor", "nurse", "viewer")
+    ),
 ):
     # 1. ตรวจสอบ Encounter และสิทธิ์ Ward
     encounter = db.execute(

@@ -17,6 +17,9 @@ from app.core.security import verify_user_token
 from app.services.auth_repository import get_active_user_access
 
 
+HUMAN_ROLES = frozenset({"admin", "doctor", "nurse", "viewer"})
+
+
 # ============================================================
 # Authentication Schemes
 # ============================================================
@@ -109,6 +112,33 @@ def require_ward(
         )
 
     return user
+
+
+def authorize_roles(
+    user: dict,
+    allowed_roles: set[str] | frozenset[str],
+) -> dict:
+    if user.get("role") not in allowed_roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Role access denied",
+        )
+
+    return user
+
+
+def require_roles(*allowed_roles: str):
+    roles = frozenset(allowed_roles)
+
+    if not roles or not roles.issubset(HUMAN_ROLES):
+        raise ValueError("At least one valid human role is required")
+
+    def role_dependency(
+        user: dict = Depends(get_current_user),
+    ) -> dict:
+        return authorize_roles(user, roles)
+
+    return role_dependency
 
 
 # ============================================================

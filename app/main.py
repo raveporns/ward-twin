@@ -20,6 +20,36 @@ from app.routers import (
 
 from app.routers.admin import router as admin_router
 
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
+from app.services.worker_runner import prediction_worker_loop
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    worker_task = asyncio.create_task(
+        prediction_worker_loop(),
+        name="prediction-worker",
+    )
+
+    logger.info("WARD TWIN prediction worker initialized")
+
+    try:
+        yield
+    finally:
+        worker_task.cancel()
+
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+
+        logger.info("WARD TWIN prediction worker stopped")
+
 
 app = FastAPI(
     title="WARD TWIN Pilot API",
@@ -28,6 +58,7 @@ app = FastAPI(
         "WARD TWIN Backend API for patient monitoring, "
         "clinical assessments, alerts, and ICU risk prediction."
     ),
+    lifespan=lifespan,
 )
 
 

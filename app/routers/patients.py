@@ -4,7 +4,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.dependencies.auth import get_current_user, require_ward
+from app.dependencies.auth import require_roles, require_ward
 
 router = APIRouter(tags=["Screens"])
 
@@ -12,7 +12,9 @@ router = APIRouter(tags=["Screens"])
 @router.get("/wards/{ward_id}/patients")
 def get_ward_patients(
     ward_id: str,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(
+        require_roles("admin", "doctor", "nurse", "viewer")
+    ),
     db: Session = Depends(get_db),
 ):
     

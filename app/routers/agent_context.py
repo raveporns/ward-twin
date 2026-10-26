@@ -8,7 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.dependencies.auth import get_current_user, require_ward
+from app.dependencies.auth import require_roles, require_ward
 
 
 router = APIRouter(tags=["AI Agent"])
@@ -148,7 +148,9 @@ def resolve_risk_assessment(
 def get_agent_context(
     encounter_id: str,
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(
+        require_roles("admin", "doctor", "nurse", "viewer")
+    ),
 ):
     # --------------------------------------------------------
     # 1. Get encounter and processing state

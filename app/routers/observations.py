@@ -11,7 +11,11 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.dependencies.auth import get_observation_identity, require_ward
+from app.dependencies.auth import (
+    authorize_roles,
+    get_observation_identity,
+    require_ward,
+)
 from app.schemas.observation import ObservationBatch
 
 
@@ -41,6 +45,7 @@ class ObservationIngestResponse(BaseModel):
         "รับข้อมูลสัญญาณชีพจาก IoT Gateway หรือเจ้าหน้าที่ โดยเลือกใช้ "
         "X-Gateway-Key หรือ Bearer JWT อย่างใดอย่างหนึ่งเท่านั้น "
         "source=iot ต้องใช้ Gateway Key; source=manual ต้องใช้ JWT. "
+        "Manual observations อนุญาตเฉพาะ Role admin, doctor หรือ nurse. "
         "ข้อมูลใหม่จะทำเครื่องหมายเพื่อรอประมวลผลการทำนาย "
         "ส่วนข้อมูลซ้ำที่ไม่มีการเพิ่มใหม่จะส่ง prediction_processing=unchanged."
     ),
@@ -71,6 +76,11 @@ def ingest_observations(
                 status_code=403,
                 detail="Manual observations require user authentication",
             )
+
+        authorize_roles(
+            identity["user"],
+            {"admin", "doctor", "nurse"},
+        )
 
         for reading in batch.readings:
             ward_id = db.execute(
