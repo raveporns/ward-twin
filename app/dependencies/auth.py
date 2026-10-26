@@ -1,26 +1,42 @@
+
 import secrets
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
 
-from app.core.database import get_db
-from app.services.auth_repository import get_active_user_access
-
-from fastapi import (
-    Depends,
-    Header,
-    HTTPException,
-)
+from fastapi import Depends, Header, HTTPException
 from fastapi.security import (
+    APIKeyHeader,
     HTTPAuthorizationCredentials,
     HTTPBearer,
 )
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.database import get_db
 from app.core.security import verify_user_token
+from app.services.auth_repository import get_active_user_access
 
 
-bearer = HTTPBearer(auto_error=False)
+# ============================================================
+# Authentication Schemes
+# ============================================================
 
+bearer = HTTPBearer(
+    auto_error=False,
+    scheme_name="HTTPBearer",
+)
+
+gateway_key_scheme = APIKeyHeader(
+    name="X-Gateway-Key",
+    scheme_name="GatewayKey",
+    description="Gateway API Key สำหรับอุปกรณ์ IoT เท่านั้น",
+    auto_error=False,
+)
+
+
+# ============================================================
+# User Authentication
+# ============================================================
 
 def resolve_user_identity(
     token: str,
@@ -29,11 +45,11 @@ def resolve_user_identity(
     payload = verify_user_token(token)
 
     # Local Development Token
-    # ใช้ได้เฉพาะ APP_ENV=local ตามที่ verify_user_token ตรวจไว้
+    # verify_user_token() ต้องจำกัดการใช้งานเฉพาะ APP_ENV=local
     if payload.get("token_type") is None:
         return payload
 
-    # Access Token ของบัญชีจริง
+    # Real Account Access Token
     try:
         account = get_active_user_access(
             db,
@@ -51,17 +67,18 @@ def resolve_user_identity(
             detail="Account access denied",
         )
 
-    # ใช้ Role และ Ward Access ล่าสุดจากฐานข้อมูล
+    # ใช้ Role และ Ward Access ล่าสุดจาก Database
     return {
         **payload,
         "role": account["role"],
         "wards": account["wards"],
     }
 
+
 def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     db: Session = Depends(get_db),
-):
+) -> dict:
     if credentials is None:
         raise HTTPException(
             status_code=401,
@@ -75,23 +92,40 @@ def get_current_user(
     )
 
 
-def require_ward(ward_id: str, user: dict):
-    if ward_id not in user["wards"]:
+# ============================================================
+# Ward Authorization
+# ============================================================
+
+def require_ward(
+    ward_id: str,
+    user: dict,
+) -> dict:
+    wards = user.get("wards") or []
+
+    if ward_id not in wards:
         raise HTTPException(
             status_code=403,
             detail="Ward access denied",
         )
+
     return user
 
 
+# ============================================================
+# Gateway Authentication
+# ============================================================
+
 def require_gateway(
     x_gateway_key: str | None = Header(default=None),
-):
+) -> dict:
+    configured_key = settings.gateway_api_key
+
     if (
-        x_gateway_key is None
+        not x_gateway_key
+        or not configured_key
         or not secrets.compare_digest(
             x_gateway_key,
-            settings.gateway_api_key,
+            configured_key,
         )
     ):
         raise HTTPException(
@@ -111,33 +145,41 @@ def require_gateway(
     }
 
 
+# ============================================================
+# Observation Authentication
+# ============================================================
+
 def get_observation_identity(
-    x_gateway_key: str | None = Header(default=None),
+    x_gateway_key: str | None = Depends(gateway_key_scheme),
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     db: Session = Depends(get_db),
-):
-    # ไม่อนุญาตให้ส่ง Gateway Key และ Bearer Token พร้อมกัน
+) -> dict:
+    # ไม่อนุญาตให้ใช้ Gateway Key และ JWT พร้อมกัน
     if x_gateway_key is not None and credentials is not None:
         raise HTTPException(
             status_code=400,
             detail="Use only one authentication method",
         )
 
-    # IoT Gateway
+    # IoT Gateway Authentication
     if x_gateway_key is not None:
-        gateway = require_gateway(x_gateway_key=x_gateway_key)
+        gateway = require_gateway(
+            x_gateway_key=x_gateway_key,
+        )
+
         return {
             "type": "gateway",
             "producer_id": gateway["producer_id"],
             "allowed_devices": gateway["allowed_devices"],
         }
 
-    # เจ้าหน้าที่ผ่าน JWT
+    # User JWT Authentication
     if credentials is not None:
         user = resolve_user_identity(
-        credentials.credentials,
-        db,
-    )
+            credentials.credentials,
+            db,
+        )
+
         return {
             "type": "user",
             "producer_id": f"user:{user['sub']}",
@@ -149,8 +191,10 @@ def get_observation_identity(
         detail="Authentication required",
     )
 
-from pydantic import BaseModel, EmailStr, Field, ConfigDict
 
+# ============================================================
+# Registration Schemas
+# ============================================================
 
 class RegisterRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -174,19 +218,21 @@ class RegisterResponse(BaseModel):
     status: str
 
 
+# ============================================================
+# Admin Authorization
+# ============================================================
+
 def require_admin(
     user: dict = Depends(get_current_user),
 ) -> dict:
     # ไม่อนุญาต Local Development Token
-    # ต้องเป็น Access Token ของบัญชีจริงเท่านั้น
     if user.get("token_type") != "access":
         raise HTTPException(
             status_code=403,
             detail="Admin access denied",
         )
 
-    # Role นี้ต้องมาจาก Database ล่าสุด
-    # ผ่าน resolve_user_identity()
+    # Role ต้องเป็นค่าล่าสุดจาก Database
     if user.get("role") != "admin":
         raise HTTPException(
             status_code=403,

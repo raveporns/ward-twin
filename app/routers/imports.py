@@ -3,16 +3,25 @@ import csv
 import io
 import json
 from datetime import date, datetime
+from enum import Enum
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from pydantic import BaseModel, Field
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.dependencies.auth import get_current_user, require_ward
 
+
 router = APIRouter(tags=["CSV Imports"])
+
+
+# ============================================================
+# Configuration
+# ============================================================
 
 COLUMNS = [
     "patient_id",
@@ -28,35 +37,114 @@ COLUMNS = [
 ]
 
 REQUIRED = [
-    "patient_id", "hn", "display_name",
-    "encounter_id", "ward_id", "admitted_at"
+    "patient_id",
+    "hn",
+    "display_name",
+    "encounter_id",
+    "ward_id",
+    "admitted_at",
 ]
 
 MAX_FILE_SIZE = 2 * 1024 * 1024
 MAX_ROWS = 1000
 
 
-@router.post("/imports", status_code=201)
+# ============================================================
+# Response Models
+# ============================================================
+
+class ImportCreatedResponse(BaseModel):
+    import_id: str
+    kind: str
+    status: str
+    total_rows: int = Field(ge=0)
+    valid_rows: int = Field(ge=0)
+    error_rows: int = Field(ge=0)
+    committed: bool
+
+
+class ImportCommittedResponse(BaseModel):
+    import_id: str
+    status: str
+    inserted_rows: int = Field(ge=0)
+    committed: bool
+
+
+class ImportRowResponse(BaseModel):
+    row_number: int
+    payload: dict
+    errors: list[str]
+    valid: bool
+
+
+class ImportDetailResponse(BaseModel):
+    import_id: str
+    kind: str
+    status: str
+    filename: str
+    ward_id: str
+    uploaded_by: str
+    total_rows: int
+    valid_rows: int
+    error_rows: int
+    created_at: str
+    committed_at: str | None
+    committed: bool
+    rows: list[ImportRowResponse]
+
+
+# ============================================================
+# 1. POST /imports
+# Upload, validate and stage CSV
+# ============================================================
+
+@router.post(
+    "/imports",
+    status_code=201,
+    response_model=ImportCreatedResponse,
+    summary="Validate and stage encounters CSV",
+    responses={
+        401: {"description": "Authentication required"},
+        403: {"description": "Ward access denied"},
+        413: {"description": "CSV exceeds 2 MB"},
+        422: {"description": "Invalid CSV"},
+    },
+)
 async def create_import(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
+    # --------------------------------------------------------
+    # Validate file
+    # --------------------------------------------------------
+
     if not file.filename or not file.filename.lower().endswith(".csv"):
-        raise HTTPException(422, "Only CSV files are supported")
+        raise HTTPException(
+            status_code=422,
+            detail="Only CSV files are supported",
+        )
 
     content = await file.read(MAX_FILE_SIZE + 1)
 
     if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(413, "CSV file exceeds 2 MB")
+        raise HTTPException(
+            status_code=413,
+            detail="CSV file exceeds 2 MB",
+        )
 
     try:
         decoded = content.decode("utf-8-sig")
-        reader = csv.DictReader(io.StringIO(decoded))
+
+        reader = csv.DictReader(
+            io.StringIO(decoded, newline=""),
+            restkey="__extra_columns__",
+            strict=True,
+        )
 
         if reader.fieldnames != COLUMNS:
             raise HTTPException(
-                422,
+                status_code=422,
                 detail={
                     "message": "CSV columns do not match template",
                     "expected": COLUMNS,
@@ -67,19 +155,36 @@ async def create_import(
         records = list(reader)
 
     except UnicodeDecodeError:
-        raise HTTPException(422, "CSV must use UTF-8 encoding")
+        raise HTTPException(
+            status_code=422,
+            detail="CSV must use UTF-8 encoding",
+        )
+
     except csv.Error:
-        raise HTTPException(422, "Invalid CSV format")
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid CSV format",
+        )
 
     if not records:
-        raise HTTPException(422, "CSV contains no data rows")
+        raise HTTPException(
+            status_code=422,
+            detail="CSV contains no data rows",
+        )
 
     if len(records) > MAX_ROWS:
-        raise HTTPException(422, "Maximum 1000 rows per import")
+        raise HTTPException(
+            status_code=422,
+            detail="Maximum 1000 rows per import",
+        )
 
-    # ป้องกัน CSV ที่มีคอลัมน์เกินหรือข้อมูลซ้ำ
+    # --------------------------------------------------------
+    # Validate rows
+    # --------------------------------------------------------
+
     seen_encounters = set()
     seen_an = set()
+
     patient_to_hn = {}
     hn_to_patient = {}
 
@@ -88,7 +193,14 @@ async def create_import(
 
     for row_number, row in enumerate(records, start=2):
         errors = []
-                # ตรวจความสัมพันธ์ Patient ID กับ HN ภายใน CSV
+
+        if "__extra_columns__" in row:
+            errors.append("Unexpected extra columns")
+
+        for column in REQUIRED:
+            if not (row.get(column) or "").strip():
+                errors.append(f"{column} is required")
+
         patient_id = (row.get("patient_id") or "").strip()
         hn = (row.get("hn") or "").strip()
 
@@ -112,21 +224,16 @@ async def create_import(
             patient_to_hn.setdefault(patient_id, hn)
             hn_to_patient.setdefault(hn, patient_id)
 
-        if None in row:
-            errors.append("Unexpected extra columns")
-
-        for column in REQUIRED:
-            if not (row.get(column) or "").strip():
-                errors.append(f"{column} is required")
-
+        # Encounter ID
         encounter_id = (row.get("encounter_id") or "").strip()
+
         if encounter_id:
             if encounter_id in seen_encounters:
                 errors.append("Duplicate encounter_id in CSV")
+
             seen_encounters.add(encounter_id)
 
-                    # ตรวจ AN ซ้ำภายใน CSV
-                # ตรวจ AN ซ้ำภายใน CSV และ Database
+        # AN
         an = (row.get("an") or "").strip()
 
         if an:
@@ -148,31 +255,40 @@ async def create_import(
             if existing_an:
                 errors.append("AN already exists in database")
 
+        # Ward access
         ward_id = (row.get("ward_id") or "").strip()
+
         if ward_id:
             ward_ids.add(ward_id)
             require_ward(ward_id, user)
 
+        # Birth date
         birth_date = (row.get("birth_date") or "").strip()
+
         if birth_date:
             try:
                 date.fromisoformat(birth_date)
             except ValueError:
-                errors.append("Invalid birth_date; use YYYY-MM-DD")
+                errors.append(
+                    "Invalid birth_date; use YYYY-MM-DD"
+                )
 
-        for column in ("admitted_at",):
-            value = (row.get(column) or "").strip()
-            if value:
-                try:
-                    parsed = datetime.fromisoformat(
-                        value.replace("Z", "+00:00")
+        # Admission datetime
+        admitted_at = (row.get("admitted_at") or "").strip()
+
+        if admitted_at:
+            try:
+                parsed = datetime.fromisoformat(
+                    admitted_at.replace("Z", "+00:00")
+                )
+
+                if parsed.tzinfo is None:
+                    errors.append(
+                        "admitted_at must include timezone"
                     )
-                    if parsed.tzinfo is None:
-                        errors.append(
-                            f"{column} must include timezone"
-                        )
-                except ValueError:
-                    errors.append(f"Invalid {column}")
+
+            except ValueError:
+                errors.append("Invalid admitted_at")
 
         staged_rows.append({
             "row_number": row_number,
@@ -183,34 +299,60 @@ async def create_import(
             "errors": errors,
         })
 
-    # Import หนึ่งครั้งรองรับ Ward เดียว
+    # --------------------------------------------------------
+    # Single ward per import
+    # --------------------------------------------------------
+
     if len(ward_ids) != 1:
         raise HTTPException(
-            422,
-            "CSV must contain exactly one ward_id"
+            status_code=422,
+            detail="CSV must contain exactly one ward_id",
         )
 
     ward_id = next(iter(ward_ids))
-    error_rows = sum(bool(r["errors"]) for r in staged_rows)
+
+    error_rows = sum(
+        bool(row["errors"])
+        for row in staged_rows
+    )
+
     valid_rows = len(staged_rows) - error_rows
-    status = "invalid" if error_rows else "validated"
+
+    import_status = (
+        "invalid" if error_rows else "validated"
+    )
+
+    # --------------------------------------------------------
+    # Save staging data
+    # --------------------------------------------------------
 
     try:
         import_id = db.execute(
             text("""
                 INSERT INTO ward_twin.import_jobs (
-                    kind, status, uploaded_by, ward_id,
-                    filename, total_rows, valid_rows, error_rows
+                    kind,
+                    status,
+                    uploaded_by,
+                    ward_id,
+                    filename,
+                    total_rows,
+                    valid_rows,
+                    error_rows
                 )
                 VALUES (
-                    'encounters', :status, :uploaded_by,
-                    :ward_id, :filename, :total_rows,
-                    :valid_rows, :error_rows
+                    'encounters',
+                    :status,
+                    :uploaded_by,
+                    :ward_id,
+                    :filename,
+                    :total_rows,
+                    :valid_rows,
+                    :error_rows
                 )
                 RETURNING import_id
             """),
             {
-                "status": status,
+                "status": import_status,
                 "uploaded_by": user["sub"],
                 "ward_id": ward_id,
                 "filename": file.filename,
@@ -224,10 +366,14 @@ async def create_import(
             db.execute(
                 text("""
                     INSERT INTO ward_twin.import_rows (
-                        import_id, row_number, payload, errors
+                        import_id,
+                        row_number,
+                        payload,
+                        errors
                     )
                     VALUES (
-                        :import_id, :row_number,
+                        :import_id,
+                        :row_number,
                         CAST(:payload AS JSONB),
                         CAST(:errors AS JSONB)
                     )
@@ -236,14 +382,16 @@ async def create_import(
                     "import_id": import_id,
                     "row_number": row["row_number"],
                     "payload": json.dumps(
-                        row["payload"], ensure_ascii=False
+                        row["payload"],
+                        ensure_ascii=False,
                     ),
-                    "errors": json.dumps(row["errors"]),
+                    "errors": json.dumps(
+                        row["errors"]
+                    ),
                 },
             )
 
         db.commit()
-        
 
     except Exception:
         db.rollback()
@@ -252,7 +400,7 @@ async def create_import(
     return {
         "import_id": str(import_id),
         "kind": "encounters",
-        "status": status,
+        "status": import_status,
         "total_rows": len(staged_rows),
         "valid_rows": valid_rows,
         "error_rows": error_rows,
@@ -260,22 +408,31 @@ async def create_import(
     }
 
 
-@router.get("/imports/{import_id}")
+# ============================================================
+# 2. GET /imports/{import_id}
+# Get import details
+# ============================================================
+
+@router.get(
+    "/imports/{import_id}",
+    response_model=ImportDetailResponse,
+    summary="Get staged import details",
+    responses={
+        401: {"description": "Authentication required"},
+        403: {"description": "Ward access denied"},
+        404: {"description": "Import not found"},
+        422: {"description": "Invalid import ID"},
+    },
+)
 def get_import_detail(
-    import_id: str,
+    import_id: UUID,
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
-    # 1. ตรวจสอบรูปแบบ UUID
-    try:
-        import_uuid = UUID(import_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid import_id format",
-        )
+    # --------------------------------------------------------
+    # Find import job
+    # --------------------------------------------------------
 
-    # 2. ค้นหา Import Job
     job = db.execute(
         text("""
             SELECT
@@ -293,7 +450,7 @@ def get_import_detail(
             FROM ward_twin.import_jobs
             WHERE import_id = :import_id
         """),
-        {"import_id": import_uuid},
+        {"import_id": import_id},
     ).mappings().first()
 
     if job is None:
@@ -302,10 +459,16 @@ def get_import_detail(
             detail="Import not found",
         )
 
-    # 3. ตรวจสอบสิทธิ์เข้าถึง Ward
+    # --------------------------------------------------------
+    # Authorization
+    # --------------------------------------------------------
+
     require_ward(job["ward_id"], user)
 
-    # 4. ดึงข้อมูล CSV ที่เก็บใน Staging
+    # --------------------------------------------------------
+    # Get staged rows
+    # --------------------------------------------------------
+
     rows = db.execute(
         text("""
             SELECT
@@ -316,24 +479,28 @@ def get_import_detail(
             WHERE import_id = :import_id
             ORDER BY row_number ASC
         """),
-        {"import_id": import_uuid},
+        {"import_id": import_id},
     ).mappings().all()
 
-    # 5. ส่งผลลัพธ์ให้ Frontend
+    # --------------------------------------------------------
+    # Response
+    # --------------------------------------------------------
+
     return {
         "import_id": str(job["import_id"]),
         "kind": job["kind"],
         "status": job["status"],
         "filename": job["filename"],
         "ward_id": job["ward_id"],
-        "uploaded_by": job["uploaded_by"],
+        "uploaded_by": str(job["uploaded_by"]),
         "total_rows": job["total_rows"],
         "valid_rows": job["valid_rows"],
         "error_rows": job["error_rows"],
         "created_at": job["created_at"].isoformat(),
         "committed_at": (
             job["committed_at"].isoformat()
-            if job["committed_at"] else None
+            if job["committed_at"] is not None
+            else None
         ),
         "committed": job["status"] == "committed",
         "rows": [
@@ -348,21 +515,42 @@ def get_import_detail(
     }
 
 
-from sqlalchemy.exc import IntegrityError
+# ============================================================
+# 3. POST /imports/{import_id}/commit
+# Commit validated import
+# ============================================================
 
-
-@router.post("/imports/{import_id}/commit")
+@router.post(
+    "/imports/{import_id}/commit",
+    response_model=ImportCommittedResponse,
+    summary="Commit a validated encounters import",
+    responses={
+        401: {"description": "Authentication required"},
+        403: {"description": "Ward access denied"},
+        404: {"description": "Import not found"},
+        409: {"description": "Import cannot be committed"},
+        422: {"description": "Invalid import ID"},
+    },
+)
 def commit_import(
     import_id: UUID,
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
     try:
-        # 1. Lock Import Job เพื่อป้องกัน Commit พร้อมกัน
+        # ----------------------------------------------------
+        # Lock import job
+        # ----------------------------------------------------
+
         job = db.execute(
             text("""
-                SELECT import_id, status, ward_id,
-                       total_rows, valid_rows, error_rows
+                SELECT
+                    import_id,
+                    status,
+                    ward_id,
+                    total_rows,
+                    valid_rows,
+                    error_rows
                 FROM ward_twin.import_jobs
                 WHERE import_id = :import_id
                 FOR UPDATE
@@ -371,14 +559,17 @@ def commit_import(
         ).mappings().first()
 
         if job is None:
-            raise HTTPException(404, "Import not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Import not found",
+            )
 
-        # 2. ตรวจสอบสิทธิ์ Ward
         require_ward(job["ward_id"], user)
 
         if job["status"] == "committed":
             raise HTTPException(
-                409, "Import has already been committed"
+                status_code=409,
+                detail="Import has already been committed",
             )
 
         if (
@@ -386,10 +577,14 @@ def commit_import(
             or job["error_rows"] != 0
         ):
             raise HTTPException(
-                409, "Import is not ready to commit"
+                status_code=409,
+                detail="Import is not ready to commit",
             )
 
-        # 3. อ่านข้อมูลที่ผ่าน Validation
+        # ----------------------------------------------------
+        # Read staging data
+        # ----------------------------------------------------
+
         rows = db.execute(
             text("""
                 SELECT payload
@@ -402,10 +597,13 @@ def commit_import(
 
         if len(rows) != job["total_rows"]:
             raise HTTPException(
-                409, "Staged row count mismatch"
+                status_code=409,
+                detail="Staged row count mismatch",
             )
-        # Revalidate staged data before commit
-        # ป้องกัน Import Job เก่าที่สร้างก่อนเพิ่ม Validation
+
+        # ----------------------------------------------------
+        # Revalidate staged data
+        # ----------------------------------------------------
 
         patient_to_hn = {}
         hn_to_patient = {}
@@ -414,26 +612,40 @@ def commit_import(
 
         for row in rows:
             payload = row["payload"]
-            an = (payload.get("an") or "").strip()
+
+            patient_id = (
+                payload.get("patient_id") or ""
+            ).strip()
+
+            hn = (
+                payload.get("hn") or ""
+            ).strip()
+
+            encounter_id = (
+                payload.get("encounter_id") or ""
+            ).strip()
+
+            an = (
+                payload.get("an") or ""
+            ).strip()
+
+            if not patient_id or not hn or not encounter_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Missing required identifiers "
+                        "in staged import"
+                    ),
+                )
 
             if an:
                 if an in seen_an:
                     raise HTTPException(
                         status_code=409,
-                        detail="Duplicate AN in staged import"
+                        detail="Duplicate AN in staged import",
                     )
 
                 seen_an.add(an)
-
-            patient_id = (payload.get("patient_id") or "").strip()
-            hn = (payload.get("hn") or "").strip()
-            encounter_id = (payload.get("encounter_id") or "").strip()
-
-            if not patient_id or not hn or not encounter_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Missing required identifiers in staged import"
-                )
 
             if (
                 patient_id in patient_to_hn
@@ -441,7 +653,10 @@ def commit_import(
             ):
                 raise HTTPException(
                     status_code=409,
-                    detail="Same patient_id has different HN in staged import"
+                    detail=(
+                        "Same patient_id has different "
+                        "HN in staged import"
+                    ),
                 )
 
             if (
@@ -450,26 +665,38 @@ def commit_import(
             ):
                 raise HTTPException(
                     status_code=409,
-                    detail="Same HN has different patient_id in staged import"
+                    detail=(
+                        "Same HN has different "
+                        "patient_id in staged import"
+                    ),
                 )
 
             if encounter_id in seen_encounters:
                 raise HTTPException(
                     status_code=409,
-                    detail="Duplicate encounter_id in staged import"
+                    detail=(
+                        "Duplicate encounter_id "
+                        "in staged import"
+                    ),
                 )
 
             if payload.get("ward_id") != job["ward_id"]:
                 raise HTTPException(
                     status_code=409,
-                    detail="Staged row ward_id does not match import ward"
+                    detail=(
+                        "Staged row ward_id does not "
+                        "match import ward"
+                    ),
                 )
 
             patient_to_hn[patient_id] = hn
             hn_to_patient[hn] = patient_id
             seen_encounters.add(encounter_id)
 
-        # 4. ตรวจสอบ Encounter ID ซ้ำ
+        # ----------------------------------------------------
+        # Check existing encounters
+        # ----------------------------------------------------
+
         for row in rows:
             payload = row["payload"]
 
@@ -480,18 +707,23 @@ def commit_import(
                     WHERE encounter_id = :encounter_id
                     LIMIT 1
                 """),
-                {"encounter_id": payload["encounter_id"]},
+                {
+                    "encounter_id": payload["encounter_id"],
+                },
             ).first()
 
             if existing:
                 raise HTTPException(
-                    409,
+                    status_code=409,
                     detail={
                         "message": "Encounter already exists",
                         "encounter_id": payload["encounter_id"],
                     },
                 )
-            an = (payload.get("an") or "").strip()
+
+            an = (
+                payload.get("an") or ""
+            ).strip()
 
             if an:
                 existing_an = db.execute(
@@ -512,13 +744,14 @@ def commit_import(
                             "an": an,
                         },
                     )
-        # 5. เพิ่ม Patient และ Encounter
-        # ใช้ Transaction เดียวกับ Import Job
+
+        # ----------------------------------------------------
+        # Insert patients and encounters
+        # ----------------------------------------------------
 
         for row in rows:
             p = row["payload"]
 
-            # ตรวจสอบ Patient เดิมจาก patient_id หรือ HN
             existing_patient = db.execute(
                 text("""
                     SELECT patient_id, hn
@@ -533,10 +766,10 @@ def commit_import(
             ).mappings().all()
 
             if existing_patient:
-                # ป้องกัน Patient ID และ HN ไม่ตรงกับข้อมูลเดิม
                 if (
                     len(existing_patient) != 1
-                    or existing_patient[0]["patient_id"] != p["patient_id"]
+                    or str(existing_patient[0]["patient_id"])
+                    != p["patient_id"]
                     or existing_patient[0]["hn"] != p["hn"]
                 ):
                     raise HTTPException(
@@ -547,6 +780,7 @@ def commit_import(
                             "hn": p["hn"],
                         },
                     )
+
             else:
                 db.execute(
                     text("""
@@ -569,12 +803,13 @@ def commit_import(
                         "patient_id": p["patient_id"],
                         "hn": p["hn"],
                         "display_name": p["display_name"],
-                        "birth_date": p.get("birth_date") or None,
+                        "birth_date": (
+                            p.get("birth_date") or None
+                        ),
                         "sex": p.get("sex") or None,
                     },
                 )
 
-            # บันทึก Encounter โดยอ้างอิง Patient
             db.execute(
                 text("""
                     INSERT INTO ward_twin.encounters (
@@ -604,11 +839,15 @@ def commit_import(
                 },
             )
 
-        # 6. เปลี่ยนสถานะ Import
+        # ----------------------------------------------------
+        # Mark import as committed
+        # ----------------------------------------------------
+
         db.execute(
             text("""
                 UPDATE ward_twin.import_jobs
-                SET status = 'committed',
+                SET
+                    status = 'committed',
                     committed_at = NOW()
                 WHERE import_id = :import_id
             """),
@@ -630,9 +869,12 @@ def commit_import(
 
     except IntegrityError:
         db.rollback()
+
         raise HTTPException(
-            409,
-            "Database constraint conflict during import"
+            status_code=409,
+            detail=(
+                "Database constraint conflict during import"
+            ),
         )
 
     except Exception:

@@ -1,5 +1,5 @@
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -15,8 +15,13 @@ def get_ward_patients(
     user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # 1. ตรวจสอบสิทธิ์ Ward
-    require_ward(ward_id, user)
+    
+    # 1. ตรวจสอบสิทธิ์และการมีอยู่ของ Ward
+    validate_ward_access(
+        ward_id=ward_id,
+        user=user,
+        db=db,
+    )
 
     # 2. ดึงข้อมูล Encounter พร้อม Processing และ Prediction ล่าสุด
     rows = db.execute(
@@ -135,3 +140,30 @@ def get_ward_patients(
         "total": len(patients),
         "patients": patients,
     }
+
+
+def validate_ward_access(
+    ward_id: str,
+    user: dict,
+    db: Session,
+):
+    # ตรวจสิทธิ์ก่อน เพื่อไม่เปิดเผยข้อมูล Ward อื่น
+    require_ward(ward_id, user)
+
+    # ตรวจว่า Ward มีอยู่จริงหรือไม่
+    ward_exists = db.execute(
+        text("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM ward_twin.wards
+                WHERE ward_id = :ward_id
+            )
+        """),
+        {"ward_id": ward_id},
+    ).scalar_one()
+
+    if not ward_exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ward not found",
+        )

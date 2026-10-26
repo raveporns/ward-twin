@@ -1,7 +1,9 @@
+
 from datetime import datetime, timezone
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -12,12 +14,92 @@ from app.dependencies.auth import get_current_user, require_ward
 router = APIRouter(tags=["Alerts"])
 
 
+# ============================================================
+# Request Models
+# ============================================================
+
 class AcknowledgementRequest(BaseModel):
+    assigned_to: str | None = Field(
+        default=None,
+        description=(
+            "Staff user ID responsible for this alert. "
+            "Currently only self-assignment is supported."
+        ),
+    )
+
+
+# ============================================================
+# Response Models
+# ============================================================
+
+class AlertResponse(BaseModel):
+    alert_id: str
+    encounter_id: str
+    prediction_id: str | None = None
+    state: str
+    created_at: datetime | None = None
+    trigger_probability: float | None = None
+    trigger_threshold: float | None = None
+    model_version: str | None = None
     assigned_to: str | None = None
+    acknowledged_by: str | None = None
+    acknowledged_at: datetime | None = None
 
 
-def get_alert_or_404(db: Session, alert_id: str):
-    return db.execute(
+class EncounterAlertsResponse(BaseModel):
+    encounter_id: str
+    alerts: list[AlertResponse]
+
+
+class AlertAcknowledgementResponse(BaseModel):
+    alert_id: str
+    encounter_id: str
+    state: str
+    assigned_to: str | None = None
+    acknowledged_by: str | None = None
+    acknowledged_at: datetime | None = None
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def serialize_alert(row: dict) -> dict:
+    """
+    Convert database values into JSON-compatible values.
+    """
+
+    result = dict(row)
+
+    for key in (
+        "alert_id",
+        "encounter_id",
+        "prediction_id",
+        "assigned_to",
+        "acknowledged_by",
+    ):
+        value = result.get(key)
+
+        if isinstance(value, UUID):
+            result[key] = str(value)
+
+    for key in (
+        "trigger_probability",
+        "trigger_threshold",
+    ):
+        value = result.get(key)
+
+        if value is not None:
+            result[key] = float(value)
+
+    return result
+
+
+def get_alert_or_404(
+    db: Session,
+    alert_id: str,
+):
+    alert = db.execute(
         text("""
             SELECT
                 a.alert_id,
@@ -27,34 +109,110 @@ def get_alert_or_404(db: Session, alert_id: str):
                 a.assigned_to,
                 a.acknowledged_by,
                 a.acknowledged_at
-            FROM ward_twin.alerts a
-            JOIN ward_twin.encounters e
-              ON e.encounter_id = a.encounter_id
+            FROM ward_twin.alerts AS a
+            JOIN ward_twin.encounters AS e
+                ON e.encounter_id = a.encounter_id
             WHERE a.alert_id = :alert_id
         """),
-        {"alert_id": alert_id},
+        {
+            "alert_id": alert_id,
+        },
     ).mappings().one_or_none()
 
+    if alert is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Alert not found",
+        )
 
-@router.get("/encounters/{encounter_id}/alerts")
+    return alert
+
+
+def staff_exists(
+    db: Session,
+    user_id: str,
+) -> bool:
+    result = db.execute(
+        text("""
+            SELECT 1
+            FROM ward_twin.staff_profiles
+            WHERE user_id = :user_id
+            LIMIT 1
+        """),
+        {
+            "user_id": user_id,
+        },
+    ).first()
+
+    return result is not None
+
+
+# ============================================================
+# 1. GET /encounters/{encounter_id}/alerts
+# ============================================================
+
+@router.get(
+    "/encounters/{encounter_id}/alerts",
+    response_model=EncounterAlertsResponse,
+    summary="Get Encounter Alerts",
+    description=(
+        "ดึงรายการแจ้งเตือนทั้งหมดของ Encounter "
+        "โดยเรียงจาก Alert ล่าสุดไปเก่าสุด "
+        "ผู้ใช้ต้องมีสิทธิ์เข้าถึง Ward ของ Encounter"
+    ),
+    responses={
+        401: {
+            "description": "Authentication required",
+        },
+        403: {
+            "description": "Ward access denied",
+        },
+        404: {
+            "description": "Encounter not found",
+        },
+        422: {
+            "description": "Invalid request parameters",
+        },
+    },
+)
 def get_encounter_alerts(
     encounter_id: str,
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
+    # --------------------------------------------------------
+    # 1. Find encounter
+    # --------------------------------------------------------
+
     encounter = db.execute(
         text("""
             SELECT ward_id
             FROM ward_twin.encounters
             WHERE encounter_id = :encounter_id
         """),
-        {"encounter_id": encounter_id},
+        {
+            "encounter_id": encounter_id,
+        },
     ).mappings().one_or_none()
 
     if encounter is None:
-        raise HTTPException(404, "Encounter not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Encounter not found",
+        )
 
-    require_ward(encounter["ward_id"], user)
+    # --------------------------------------------------------
+    # 2. Ward authorization
+    # --------------------------------------------------------
+
+    require_ward(
+        encounter["ward_id"],
+        user,
+    )
+
+    # --------------------------------------------------------
+    # 3. Get alerts
+    # --------------------------------------------------------
 
     alerts = db.execute(
         text("""
@@ -72,18 +230,59 @@ def get_encounter_alerts(
                 acknowledged_at
             FROM ward_twin.alerts
             WHERE encounter_id = :encounter_id
-            ORDER BY created_at DESC, alert_id DESC
+            ORDER BY
+                created_at DESC,
+                alert_id DESC
         """),
-        {"encounter_id": encounter_id},
+        {
+            "encounter_id": encounter_id,
+        },
     ).mappings().all()
 
+    # --------------------------------------------------------
+    # 4. Response
+    # --------------------------------------------------------
+
     return {
-        "encounter_id": encounter_id,
-        "alerts": [dict(alert) for alert in alerts],
+        "encounter_id": str(encounter_id),
+        "alerts": [
+            serialize_alert(alert)
+            for alert in alerts
+        ],
     }
 
 
-@router.put("/alerts/{alert_id}/acknowledgement")
+# ============================================================
+# 2. PUT /alerts/{alert_id}/acknowledgement
+# ============================================================
+
+@router.put(
+    "/alerts/{alert_id}/acknowledgement",
+    response_model=AlertAcknowledgementResponse,
+    summary="Acknowledge Alert",
+    description=(
+        "บันทึกการรับทราบ Alert โดยเจ้าหน้าที่ที่มีสิทธิ์ "
+        "เข้าถึง Ward และมีข้อมูลใน staff_profiles "
+        "ปัจจุบันรองรับเฉพาะการรับทราบด้วยตัวเอง"
+    ),
+    responses={
+        401: {
+            "description": "Authentication required",
+        },
+        403: {
+            "description": "Ward access denied or user is not staff",
+        },
+        404: {
+            "description": "Alert not found",
+        },
+        409: {
+            "description": "Alert cannot be acknowledged",
+        },
+        422: {
+            "description": "Invalid assigned staff",
+        },
+    },
+)
 def acknowledge_alert(
     alert_id: str,
     payload: AcknowledgementRequest,
@@ -91,7 +290,10 @@ def acknowledge_alert(
     user: dict = Depends(get_current_user),
 ):
     try:
-        # Lock แถว Alert เพื่อป้องกันการรับทราบพร้อมกัน
+        # ----------------------------------------------------
+        # 1. Lock alert row
+        # ----------------------------------------------------
+
         alert = db.execute(
             text("""
                 SELECT
@@ -101,60 +303,104 @@ def acknowledge_alert(
                     a.state,
                     a.acknowledged_by,
                     a.assigned_to
-                FROM ward_twin.alerts a
-                JOIN ward_twin.encounters e
-                  ON e.encounter_id = a.encounter_id
+                FROM ward_twin.alerts AS a
+                JOIN ward_twin.encounters AS e
+                    ON e.encounter_id = a.encounter_id
                 WHERE a.alert_id = :alert_id
                 FOR UPDATE OF a
             """),
-            {"alert_id": alert_id},
+            {
+                "alert_id": alert_id,
+            },
         ).mappings().one_or_none()
 
         if alert is None:
-            raise HTTPException(404, "Alert not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Alert not found",
+            )
 
-        require_ward(alert["ward_id"], user)
+        # ----------------------------------------------------
+        # 2. Ward authorization
+        # ----------------------------------------------------
+
+        require_ward(
+            alert["ward_id"],
+            user,
+        )
+
+        # ----------------------------------------------------
+        # 3. Validate alert state
+        # ----------------------------------------------------
 
         if alert["state"] != "open":
-            raise HTTPException(409, "Alert is not open")
+            raise HTTPException(
+                status_code=409,
+                detail="Alert is not open",
+            )
 
         if alert["acknowledged_by"] is not None:
-            raise HTTPException(409, "Alert already acknowledged")
+            raise HTTPException(
+                status_code=409,
+                detail="Alert already acknowledged",
+            )
 
-        actor_id = user["sub"]
-        assigned_to = payload.assigned_to or alert["assigned_to"] or actor_id
+        # ----------------------------------------------------
+        # 4. Resolve actor and assignment
+        # ----------------------------------------------------
 
-        # ตรวจว่าผู้รับผิดชอบมีตัวตนในฐานข้อมูล
-        staff = db.execute(
-            text("""
-                SELECT user_id
-                FROM ward_twin.staff_profiles
-                WHERE user_id = :user_id
-            """),
-            {"user_id": assigned_to},
-        ).scalar_one_or_none()
+        actor_id = str(user["sub"])
 
-        if staff is None:
-            raise HTTPException(422, "Assigned staff not found")
+        assigned_to = (
+            payload.assigned_to
+            or alert["assigned_to"]
+            or actor_id
+        )
 
-        actor = db.execute(
-            text("""
-                SELECT user_id
-                FROM ward_twin.staff_profiles
-                WHERE user_id = :user_id
-            """),
-            {"user_id": actor_id},
-        ).scalar_one_or_none()
+        assigned_to = str(assigned_to)
 
-        if actor is None:
-            raise HTTPException(403, "Current user is not registered staff")
+        # ----------------------------------------------------
+        # 5. Validate current staff
+        # ----------------------------------------------------
 
-        # ป้องกันการมอบหมายให้เจ้าหน้าที่ที่ไม่มีสิทธิ์ Ward นี้
+        if not staff_exists(
+            db=db,
+            user_id=actor_id,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Current user is not registered staff",
+            )
+
+        # ----------------------------------------------------
+        # 6. Validate assigned staff
+        # ----------------------------------------------------
+
+        if not staff_exists(
+            db=db,
+            user_id=assigned_to,
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Assigned staff not found",
+            )
+
+        # ----------------------------------------------------
+        # 7. Restrict assignment to self
+        # ----------------------------------------------------
+
         if assigned_to != actor_id:
             raise HTTPException(
-                422,
-                "Assigning another staff member requires ward membership verification",
+                status_code=422,
+                detail=(
+                    "Assigning another staff member requires "
+                    "ward membership verification"
+                ),
             )
+
+        # ----------------------------------------------------
+        # 8. Acknowledge alert
+        # ----------------------------------------------------
 
         result = db.execute(
             text("""
@@ -180,8 +426,17 @@ def acknowledge_alert(
             },
         ).mappings().one()
 
+        # ----------------------------------------------------
+        # 9. Commit transaction
+        # ----------------------------------------------------
+
         db.commit()
-        return dict(result)
+
+        return serialize_alert(result)
+
+    except HTTPException:
+        db.rollback()
+        raise
 
     except Exception:
         db.rollback()

@@ -1,21 +1,174 @@
 
+from datetime import date, datetime
+from typing import Any, Literal
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.dependencies.auth import get_current_user, require_ward
 
+
 router = APIRouter(tags=["Digital Twin"])
 
 
-@router.get("/encounters/{encounter_id}/twin")
+# ============================================================
+# Response Models
+# ============================================================
+
+class EncounterTwinResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    encounter_id: str
+    patient_id: str
+    hn: str | None = None
+    display_name: str | None = None
+    birth_date: date | None = None
+    sex: str | None = None
+    allergy_status: str | None = None
+    an: str | None = None
+    ward_id: str
+    bed_label: str | None = None
+    admitted_at: datetime | None = None
+
+
+class VitalSignResponse(BaseModel):
+    metric: str
+    value: float | None = None
+    unit: str
+    measured_at: datetime | None = None
+    device_id: str | None = None
+    source: str
+
+
+class TwinPredictionResponse(BaseModel):
+    status: str
+    risk_score: float | None = Field(
+        default=None,
+        ge=0,
+        le=1,
+    )
+    prediction_id: str | None = None
+    model_version: str | None = None
+    assessed_at: datetime | None = None
+    unavailable_reason: str | None = None
+
+
+class PatientTwinResponse(BaseModel):
+    encounter: EncounterTwinResponse
+    latest_vitals: list[VitalSignResponse]
+    prediction: TwinPredictionResponse
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def serialize_value(value: Any) -> Any:
+    """Convert UUID values to JSON-compatible strings."""
+    if isinstance(value, UUID):
+        return str(value)
+
+    return value
+
+
+def build_prediction(
+    processing,
+    latest_prediction,
+) -> dict:
+    prediction_data = {
+        "status": "not_available",
+        "risk_score": None,
+        "prediction_id": None,
+        "model_version": None,
+        "assessed_at": None,
+        "unavailable_reason": None,
+    }
+
+    has_pending_work = (
+        processing is not None
+        and processing["dirty_version"] is not None
+        and (
+            processing["processed_version"] is None
+            or processing["dirty_version"]
+            > processing["processed_version"]
+        )
+    )
+
+    if has_pending_work:
+        prediction_data["status"] = "pending"
+        return prediction_data
+
+    if latest_prediction is None:
+        return prediction_data
+
+    prediction_status = latest_prediction["status"]
+    probability = latest_prediction["probability"]
+
+    prediction_data = {
+        "status": prediction_status,
+        "risk_score": (
+            float(probability)
+            if (
+                prediction_status == "ready"
+                and probability is not None
+            )
+            else None
+        ),
+        "prediction_id": serialize_value(
+            latest_prediction["prediction_id"]
+        ),
+        "model_version": latest_prediction["model_version"],
+        "assessed_at": latest_prediction["assessed_at"],
+        "unavailable_reason": (
+            latest_prediction["unavailable_reason"]
+        ),
+    }
+
+    return prediction_data
+
+
+# ============================================================
+# GET /encounters/{encounter_id}/twin
+# ============================================================
+
+@router.get(
+    "/encounters/{encounter_id}/twin",
+    response_model=PatientTwinResponse,
+    summary="Get Patient Digital Twin",
+    description=(
+        "ดึงข้อมูล Digital Twin ของผู้ป่วย ประกอบด้วย "
+        "ข้อมูล Encounter สัญญาณชีพล่าสุดของแต่ละ Metric "
+        "และผลประเมินความเสี่ยงจากโมเดล "
+        "หากมีข้อมูลใหม่รอประมวลผล จะแสดง Prediction เป็น pending"
+    ),
+    responses={
+        401: {
+            "description": "Authentication required",
+        },
+        403: {
+            "description": "Ward access denied",
+        },
+        404: {
+            "description": "Encounter not found",
+        },
+        422: {
+            "description": "Invalid request parameters",
+        },
+    },
+)
 def get_patient_twin(
     encounter_id: str,
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
-    # 1. ดึงข้อมูลผู้ป่วยและ Encounter
+    # --------------------------------------------------------
+    # 1. Get patient and encounter
+    # --------------------------------------------------------
+
     encounter = db.execute(
         text("""
             SELECT
@@ -44,10 +197,19 @@ def get_patient_twin(
             detail="Encounter not found",
         )
 
-    # 2. ตรวจสอบสิทธิ์ Ward
-    require_ward(encounter["ward_id"], user)
+    # --------------------------------------------------------
+    # 2. Ward authorization
+    # --------------------------------------------------------
 
-    # 3. ดึง Vital Signs ล่าสุดของแต่ละ Metric
+    require_ward(
+        encounter["ward_id"],
+        user,
+    )
+
+    # --------------------------------------------------------
+    # 3. Latest vital signs per metric
+    # --------------------------------------------------------
+
     observations = db.execute(
         text("""
             SELECT DISTINCT ON (m.metric)
@@ -69,12 +231,18 @@ def get_patient_twin(
         {"encounter_id": encounter_id},
     ).mappings().all()
 
-    # 4. แปลงข้อมูลเป็น JSON-compatible values
-    encounter_data = dict(encounter)
+    # --------------------------------------------------------
+    # 4. Build encounter response
+    # --------------------------------------------------------
 
-    for field in ("birth_date", "admitted_at"):
-        if encounter_data.get(field) is not None:
-            encounter_data[field] = encounter_data[field].isoformat()
+    encounter_data = {
+        key: serialize_value(value)
+        for key, value in dict(encounter).items()
+    }
+
+    # --------------------------------------------------------
+    # 5. Build latest vitals
+    # --------------------------------------------------------
 
     latest_vitals = []
 
@@ -87,16 +255,15 @@ def get_patient_twin(
                 else None
             ),
             "unit": row["unit"],
-            "measured_at": (
-                row["measured_at"].isoformat()
-                if row["measured_at"] is not None
-                else None
-            ),
-            "device_id": row["device_id"],
+            "measured_at": row["measured_at"],
+            "device_id": serialize_value(row["device_id"]),
             "source": row["source"],
         })
 
-    # 5. ตรวจสถานะ Processing Queue
+    # --------------------------------------------------------
+    # 6. Processing queue status
+    # --------------------------------------------------------
+
     processing = db.execute(
         text("""
             SELECT
@@ -108,7 +275,10 @@ def get_patient_twin(
         {"encounter_id": encounter_id},
     ).mappings().first()
 
-    # 6. ดึง Prediction ล่าสุดจากฐานข้อมูล
+    # --------------------------------------------------------
+    # 7. Latest risk prediction
+    # --------------------------------------------------------
+
     latest_prediction = db.execute(
         text("""
             SELECT
@@ -128,57 +298,19 @@ def get_patient_twin(
         {"encounter_id": encounter_id},
     ).mappings().first()
 
-    # 7. กำหนดค่าเริ่มต้น
-    prediction_data = {
-        "status": "not_available",
-        "risk_score": None,
-        "prediction_id": None,
-        "model_version": None,
-        "assessed_at": None,
-        "unavailable_reason": None,
-    }
+    # --------------------------------------------------------
+    # 8. Resolve prediction state
+    # --------------------------------------------------------
 
-    # 8. ตรวจว่ามีข้อมูลใหม่รอ Worker หรือไม่
-    has_pending_work = (
-        processing is not None
-        and processing["dirty_version"] is not None
-        and (
-            processing["processed_version"] is None
-            or processing["dirty_version"]
-            > processing["processed_version"]
-        )
+    prediction_data = build_prediction(
+        processing=processing,
+        latest_prediction=latest_prediction,
     )
 
-    if has_pending_work:
-        prediction_data["status"] = "pending"
+    # --------------------------------------------------------
+    # 9. Return Digital Twin
+    # --------------------------------------------------------
 
-    # 9. ถ้าไม่มีงานค้าง ให้แสดง Prediction ล่าสุด
-    elif latest_prediction is not None:
-        prediction_status = latest_prediction["status"]
-
-        prediction_data = {
-            "status": prediction_status,
-            "risk_score": (
-                float(latest_prediction["probability"])
-                if (
-                    prediction_status == "ready"
-                    and latest_prediction["probability"] is not None
-                )
-                else None
-            ),
-            "prediction_id": latest_prediction["prediction_id"],
-            "model_version": latest_prediction["model_version"],
-            "assessed_at": (
-                latest_prediction["assessed_at"].isoformat()
-                if latest_prediction["assessed_at"] is not None
-                else None
-            ),
-            "unavailable_reason": (
-                latest_prediction["unavailable_reason"]
-            ),
-        }
-
-    # 10. ส่งข้อมูลทั้งหมดกลับให้ Frontend
     return {
         "encounter": encounter_data,
         "latest_vitals": latest_vitals,

@@ -2,6 +2,9 @@
 import hashlib
 import json
 from datetime import datetime, timezone
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
@@ -15,7 +18,41 @@ from app.schemas.observation import ObservationBatch
 router = APIRouter(tags=["Observations"])
 
 
-@router.post("/observations", status_code=200)
+class ObservationItemResponse(BaseModel):
+    reading_id: str
+    encounter_id: str
+    result: Literal["inserted", "duplicate"]
+
+
+class ObservationIngestResponse(BaseModel):
+    inserted_readings: int = Field(ge=0)
+    duplicate_readings: int = Field(ge=0)
+    received_at: datetime
+    items: list[ObservationItemResponse]
+    prediction_processing: Literal["pending", "unchanged"]
+
+
+@router.post(
+    "/observations",
+    status_code=200,
+    response_model=ObservationIngestResponse,
+    summary="Ingest Observations",
+    description=(
+        "รับข้อมูลสัญญาณชีพจาก IoT Gateway หรือเจ้าหน้าที่ โดยเลือกใช้ "
+        "X-Gateway-Key หรือ Bearer JWT อย่างใดอย่างหนึ่งเท่านั้น "
+        "source=iot ต้องใช้ Gateway Key; source=manual ต้องใช้ JWT. "
+        "ข้อมูลใหม่จะทำเครื่องหมายเพื่อรอประมวลผลการทำนาย "
+        "ส่วนข้อมูลซ้ำที่ไม่มีการเพิ่มใหม่จะส่ง prediction_processing=unchanged."
+    ),
+    responses={
+        400: {"description": "ส่ง Gateway Key และ Bearer JWT พร้อมกัน"},
+        401: {"description": "ไม่ได้ยืนยันตัวตนหรือข้อมูลยืนยันตัวตนไม่ถูกต้อง"},
+        403: {"description": "ไม่มีสิทธิ์ส่งข้อมูลหรือเข้าถึงอุปกรณ์/วอร์ด"},
+        404: {"description": "ไม่พบ Encounter สำหรับข้อมูล Manual"},
+        409: {"description": "Reading ID ขัดแย้ง หรือ Device Assignment ไม่ชัดเจน"},
+        422: {"description": "ข้อมูลไม่ผ่าน Validation"},
+    },
+)
 def ingest_observations(
     batch: ObservationBatch,
     identity: dict = Depends(get_observation_identity),
@@ -123,8 +160,8 @@ def ingest_observations(
                     WHERE da.device_id = :device_id
                       AND da.valid_from <= :measured_at
                       AND (
-                          da.valid_to IS NULL
-                          OR :measured_at < da.valid_to
+                           da.valid_to IS NULL
+                           OR :measured_at < da.valid_to
                       )
                       AND e.ward_id = :ward_id
                 """),
@@ -358,7 +395,7 @@ def ingest_observations(
         "duplicate_readings": duplicates,
         "received_at": received_at.isoformat().replace("+00:00", "Z"),
         "items": items,
-        "prediction_processing": "pending",
+        "prediction_processing": "pending" if inserted > 0 else "unchanged",
     }
 
 
@@ -632,5 +669,5 @@ def save_manual_observations(
         "duplicate_readings": duplicates,
         "received_at": received_at.isoformat().replace("+00:00", "Z"),
         "items": items,
-        "prediction_processing": "pending",
+        "prediction_processing": "pending" if inserted > 0 else "unchanged",
     }

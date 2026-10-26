@@ -138,6 +138,7 @@ def test_create_access_token_expired_rejected():
         decode_token(expired_token)
 
 
+
 def test_create_access_token_invalid_signature():
     token = create_access_token(
         user_id="test-user-001",
@@ -145,10 +146,15 @@ def test_create_access_token_invalid_signature():
         wards=["WARD-A"],
     )
 
+    wrong_secret = "ward-twin-invalid-signature-test-secret-2026"
+
+    assert len(wrong_secret.encode("utf-8")) >= 32
+    assert wrong_secret != settings.jwt_secret
+
     with pytest.raises(jwt.InvalidSignatureError):
         jwt.decode(
             token,
-            "different-secret-for-testing",
+            wrong_secret,
             algorithms=["HS256"],
             audience=settings.jwt_audience,
             issuer=settings.jwt_issuer,
