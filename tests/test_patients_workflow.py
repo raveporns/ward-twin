@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from app.core.database import get_db
 from app.dependencies.auth import get_current_user
 from app.main import app
+from app.ml.model_loader import load_model_metadata
 
 
 WARD_ID = "WARD-TEST"
@@ -49,6 +50,7 @@ def patient_row():
         "patient_id": "PAT-TEST-001",
         "hn": "HN-TEST-001",
         "display_name": "Synthetic Patient",
+        "birth_date": None,
         "sex": "unknown",
         "allergy_status": "unknown",
         "encounter_id": ENCOUNTER_ID,
@@ -83,11 +85,32 @@ def alert_row(
     }
 
 
-def request_patients(client, alerts, row=None):
+def diagnostic_row(*, observation_count=0, **sample_counts):
+    row = {
+        "encounter_id": ENCOUNTER_ID,
+        "observation_count": observation_count,
+        **{
+            f"{metric}_sample_count": 0
+            for metric in (
+                "heart_rate",
+                "respiratory_rate",
+                "spo2",
+                "systolic_bp",
+                "diastolic_bp",
+                "temperature",
+            )
+        },
+    }
+    row.update(sample_counts)
+    return row
+
+
+def request_patients(client, alerts, row=None, diagnostics=None):
     db = MagicMock()
     db.execute.side_effect = [
         query_result(scalar=True),
         query_result(rows=[row or patient_row()]),
+        query_result(rows=[diagnostics or diagnostic_row()]),
         query_result(rows=alerts),
     ]
     override_db(db)
@@ -163,6 +186,194 @@ def test_ward_patients_workflow_status(
     assert patient["workflow_status_label"] == expected_label
 
 
+def test_no_observations_has_model_features_missing_diagnostics(client):
+    row = {
+        **patient_row(),
+        "birth_date": None,
+        "sex": None,
+    }
+
+    response, _ = request_patients(client, [], row=row)
+
+    prediction = response.json()["patients"][0]["prediction"]
+    assert prediction["status"] == "not_available"
+    assert prediction["unavailable_reason"] == "no_observations"
+    assert prediction["unavailable_message"] == (
+        "ยังไม่มีข้อมูลสัญญาณชีพสำหรับการทำนาย"
+    )
+    assert prediction["missing_features"] == load_model_metadata()[
+        "feature_columns"
+    ]
+
+
+def test_observations_without_prediction_record_are_not_assumed_pending(client):
+    response, _ = request_patients(
+        client,
+        [],
+        diagnostics=diagnostic_row(
+            observation_count=3,
+            heart_rate_sample_count=2,
+        ),
+    )
+
+    prediction = response.json()["patients"][0]["prediction"]
+    assert prediction["status"] == "not_available"
+    assert prediction["unavailable_reason"] == "no_prediction_record"
+    assert prediction["unavailable_message"] == (
+        "ยังไม่มีผลการประมวลผลจากโมเดล"
+    )
+    assert prediction["recommended_action"] == (
+        "ตรวจสอบสถานะการประมวลผลของระบบ"
+    )
+
+
+def test_unavailable_missing_single_feature_group(client):
+    row = {
+        **patient_row(),
+        "birth_date": datetime(1980, 1, 1).date(),
+        "sex": "female",
+        "prediction_id": 1,
+        "prediction_status": "unavailable",
+        "unavailable_reason": "missing_spo2",
+    }
+
+    response, _ = request_patients(
+        client,
+        [],
+        row=row,
+        diagnostics=diagnostic_row(observation_count=2),
+    )
+
+    prediction = response.json()["patients"][0]["prediction"]
+    assert prediction["unavailable_reason"] == "missing_spo2"
+    assert prediction["missing_features"] == [
+        feature
+        for feature in load_model_metadata()["feature_columns"]
+        if feature.startswith("spo2_")
+    ]
+
+
+def test_unavailable_multiple_missing_features(client):
+    row = {
+        **patient_row(),
+        "birth_date": datetime(1980, 1, 1).date(),
+        "sex": "female",
+        "prediction_id": 1,
+        "prediction_status": "unavailable",
+        "unavailable_reason": "missing_heart_rate,missing_temperature",
+    }
+
+    response, _ = request_patients(
+        client,
+        [],
+        row=row,
+        diagnostics=diagnostic_row(observation_count=4),
+    )
+
+    prediction = response.json()["patients"][0]["prediction"]
+    expected = [
+        feature
+        for feature in load_model_metadata()["feature_columns"]
+        if feature.startswith(("heart_rate_", "temperature_"))
+    ]
+    assert prediction["missing_features"] == expected
+    assert prediction["unavailable_reason"] == (
+        "missing_heart_rate,missing_temperature"
+    )
+    assert "อัตราการเต้นหัวใจ" in prediction["unavailable_message"]
+    assert "อุณหภูมิ" in prediction["unavailable_message"]
+
+
+def test_insufficient_samples_are_not_missing_features(client):
+    row = {
+        **patient_row(),
+        "birth_date": datetime(1980, 1, 1).date(),
+        "sex": "female",
+        "prediction_id": 1,
+        "prediction_status": "unavailable",
+        "unavailable_reason": "insufficient_samples_heart_rate",
+    }
+
+    response, _ = request_patients(
+        client,
+        [],
+        row=row,
+        diagnostics=diagnostic_row(
+            observation_count=1,
+            heart_rate_sample_count=1,
+        ),
+    )
+
+    prediction = response.json()["patients"][0]["prediction"]
+    assert prediction["unavailable_reason"] == (
+        "insufficient_samples_heart_rate"
+    )
+    assert prediction["missing_features"] == []
+    assert "จำนวนตัวอย่างไม่เพียงพอ" in prediction["unavailable_message"]
+
+
+def test_ready_prediction_keeps_score_and_has_no_unavailability_diagnostics(client):
+    row = {
+        **patient_row(),
+        "prediction_id": 99,
+        "prediction_status": "ready",
+        "probability": 0.73,
+        "model_version": "test-model",
+        "assessed_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "unavailable_reason": None,
+    }
+
+    response, _ = request_patients(client, [], row=row)
+
+    prediction = response.json()["patients"][0]["prediction"]
+    assert prediction["status"] == "ready"
+    assert prediction["risk_score"] == 0.73
+    assert prediction["unavailable_reason"] is None
+    assert prediction["unavailable_message"] is None
+    assert prediction["missing_features"] == []
+    assert prediction["recommended_action"] is None
+
+
+def test_failed_prediction_does_not_expose_internal_error(client):
+    row = {
+        **patient_row(),
+        "prediction_id": 100,
+        "prediction_status": "failed",
+        "unavailable_reason": "Traceback: private database details",
+    }
+
+    response, _ = request_patients(client, [], row=row)
+
+    prediction = response.json()["patients"][0]["prediction"]
+    assert prediction["status"] == "failed"
+    assert prediction["risk_score"] is None
+    assert prediction["unavailable_reason"] == "processing_failed"
+    assert "Traceback" not in str(prediction)
+    assert "private database details" not in str(prediction)
+
+
+def test_pending_prediction_has_confirmed_processing_message(client):
+    row = {
+        **patient_row(),
+        "dirty_version": 2,
+        "processed_version": 1,
+    }
+
+    response, _ = request_patients(
+        client,
+        [],
+        row=row,
+        diagnostics=diagnostic_row(observation_count=1),
+    )
+
+    prediction = response.json()["patients"][0]["prediction"]
+    assert prediction["status"] == "pending"
+    assert prediction["unavailable_reason"] is None
+    assert prediction["unavailable_message"] == (
+        "มีข้อมูลใหม่รอการประมวลผล"
+    )
+
+
 def test_ward_patients_response_is_valid_utf8_with_thai_text(client):
     thai_name = "ผู้ป่วยทดสอบภาษาไทย"
     row = {**patient_row(), "display_name": thai_name}
@@ -190,7 +401,7 @@ def test_assessment_for_another_alert_does_not_count(client):
     assert response.status_code == 200
     assert response.json()["patients"][0]["workflow_status"] == "pending_assessment"
 
-    workflow_query = str(db.execute.call_args_list[2].args[0])
+    workflow_query = str(db.execute.call_args_list[3].args[0])
     assert "assessment.alert_id = a.alert_id" in workflow_query
     assert "assessment.encounter_id = a.encounter_id" in workflow_query
     assert "e.ward_id = :ward_id" in workflow_query
@@ -222,7 +433,12 @@ def test_ward_patients_preserve_existing_response_and_get_is_read_only(client):
             "prediction_id": None,
             "model_version": None,
             "assessed_at": None,
-            "unavailable_reason": None,
+            "unavailable_reason": "no_observations",
+            "unavailable_message": "ยังไม่มีข้อมูลสัญญาณชีพสำหรับการทำนาย",
+            "missing_features": list(load_model_metadata()["feature_columns"]),
+            "recommended_action": (
+                "บันทึกข้อมูลสัญญาณชีพที่จำเป็น แล้วรอระบบประมวลผล"
+            ),
         },
     }
     db.commit.assert_not_called()

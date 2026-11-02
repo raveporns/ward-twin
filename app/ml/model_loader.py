@@ -11,13 +11,17 @@ MODEL_DIR = BASE_DIR / "models"
 
 
 @lru_cache(maxsize=1)
-def load_model():
-    model_path = MODEL_DIR / "ward_twin_mock_xgb.json"
+def load_model_metadata():
     metadata_path = MODEL_DIR / "ward_twin_mock_xgb_metadata.json"
 
     with metadata_path.open(encoding="utf-8") as f:
-        metadata = json.load(f)
+        return json.load(f)
 
+
+@lru_cache(maxsize=1)
+def load_model():
+    model_path = MODEL_DIR / "ward_twin_mock_xgb.json"
+    metadata = load_model_metadata()
     model = xgb.XGBClassifier()
     model.load_model(str(model_path))
 
