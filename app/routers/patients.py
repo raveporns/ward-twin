@@ -1,39 +1,24 @@
 
+import logging
+from collections import Counter
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.dependencies.auth import require_roles, require_ward
+from app.ml.model_loader import load_model_metadata
+from app.services.patient_response import (
+    WORKFLOW_STATUS_LABELS,
+    build_patient_prediction,
+    get_patient_diagnostics,
+    get_workflow_status,
+)
 
 router = APIRouter(tags=["Screens"])
-
-WORKFLOW_STATUS_LABELS = {
-    "normal": "ไม่มีรายการรอดำเนินการ",
-    "pending_acknowledgement": "รอรับทราบ",
-    "pending_assessment": "รอประเมินผู้ป่วย",
-    "assessed": "ประเมินผู้ป่วยแล้ว",
-}
-
-
-def get_workflow_status(alerts: list[dict]) -> str:
-    workflow_alerts = [
-        alert
-        for alert in alerts
-        if alert["state"] == "open"
-    ]
-
-    if not workflow_alerts:
-        return "normal"
-
-    if any(alert["acknowledged_by"] is None for alert in workflow_alerts):
-        return "pending_acknowledgement"
-
-    if any(not alert["has_assessment"] for alert in workflow_alerts):
-        return "pending_assessment"
-
-    return "assessed"
-
+logger = logging.getLogger(__name__)
 
 @router.get("/wards/{ward_id}/patients")
 def get_ward_patients(
@@ -58,6 +43,7 @@ def get_ward_patients(
                 p.patient_id,
                 p.hn,
                 p.display_name,
+                p.birth_date,
                 p.sex,
                 p.allergy_status,
                 e.encounter_id,
@@ -98,6 +84,15 @@ def get_ward_patients(
         {"ward_id": ward_id},
     ).mappings().all()
 
+    feature_columns = load_model_metadata()["feature_columns"]
+    diagnostic_as_of = datetime.now(timezone.utc)
+    diagnostics_by_encounter = get_patient_diagnostics(
+        db,
+        ward_id=ward_id,
+        encounter_ids=[row["encounter_id"] for row in rows],
+        as_of=diagnostic_as_of,
+    )
+
     workflow_alerts_by_encounter = {}
     if rows:
         encounter_ids = [row["encounter_id"] for row in rows]
@@ -135,54 +130,26 @@ def get_ward_patients(
 
     # 3. แปลงข้อมูลสำหรับ Frontend
     patients = []
+    prediction_status_counts = Counter()
+    unknown_reason_count = 0
 
     for row in rows:
         workflow_status = get_workflow_status(
             workflow_alerts_by_encounter.get(row["encounter_id"], [])
         )
-
-        prediction = {
-            "status": "not_available",
-            "risk_score": None,
-            "prediction_id": None,
-            "model_version": None,
-            "assessed_at": None,
-            "unavailable_reason": None,
-        }
-
-        has_pending_work = (
-            row["dirty_version"] is not None
-            and (
-                row["processed_version"] is None
-                or row["dirty_version"] > row["processed_version"]
-            )
+        diagnostic = diagnostics_by_encounter.get(
+            row["encounter_id"],
+            {"observation_count": 0},
         )
+        prediction, has_unknown_reason = build_patient_prediction(
+            row,
+            diagnostic,
+            feature_columns=feature_columns,
+            as_of=diagnostic_as_of,
+        )
+        unknown_reason_count += int(has_unknown_reason)
 
-        if has_pending_work:
-            prediction["status"] = "pending"
-
-        elif row["prediction_id"] is not None:
-            prediction_status = row["prediction_status"]
-
-            prediction = {
-                "status": prediction_status,
-                "risk_score": (
-                    float(row["probability"])
-                    if (
-                        prediction_status == "ready"
-                        and row["probability"] is not None
-                    )
-                    else None
-                ),
-                "prediction_id": row["prediction_id"],
-                "model_version": row["model_version"],
-                "assessed_at": (
-                    row["assessed_at"].isoformat()
-                    if row["assessed_at"] is not None
-                    else None
-                ),
-                "unavailable_reason": row["unavailable_reason"],
-            }
+        prediction_status_counts[prediction["status"]] += 1
 
         patients.append({
             "patient_id": row["patient_id"],
@@ -202,6 +169,17 @@ def get_ward_patients(
             "workflow_status_label": WORKFLOW_STATUS_LABELS[workflow_status],
             "prediction": prediction,
         })
+
+    logger.info(
+        "Ward patient prediction summary: patients=%d prediction_statuses=%s",
+        len(patients),
+        dict(prediction_status_counts),
+    )
+    if unknown_reason_count:
+        logger.warning(
+            "Prediction diagnostics encountered unknown reason codes: count=%d",
+            unknown_reason_count,
+        )
 
     # 4. ส่งข้อมูลกลับให้ Ward Dashboard
     return {
