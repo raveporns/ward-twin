@@ -1,12 +1,38 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.dependencies.auth import require_roles, require_ward
 
 router = APIRouter(tags=["Screens"])
+
+WORKFLOW_STATUS_LABELS = {
+    "normal": "ไม่มีรายการรอดำเนินการ",
+    "pending_acknowledgement": "รอรับทราบ",
+    "pending_assessment": "รอประเมินผู้ป่วย",
+    "assessed": "ประเมินผู้ป่วยแล้ว",
+}
+
+
+def get_workflow_status(alerts: list[dict]) -> str:
+    workflow_alerts = [
+        alert
+        for alert in alerts
+        if alert["state"] == "open"
+    ]
+
+    if not workflow_alerts:
+        return "normal"
+
+    if any(alert["acknowledged_by"] is None for alert in workflow_alerts):
+        return "pending_acknowledgement"
+
+    if any(not alert["has_assessment"] for alert in workflow_alerts):
+        return "pending_assessment"
+
+    return "assessed"
 
 
 @router.get("/wards/{ward_id}/patients")
@@ -72,10 +98,49 @@ def get_ward_patients(
         {"ward_id": ward_id},
     ).mappings().all()
 
+    workflow_alerts_by_encounter = {}
+    if rows:
+        encounter_ids = [row["encounter_id"] for row in rows]
+        workflow_alerts = db.execute(
+            text("""
+                SELECT
+                    a.encounter_id,
+                    a.state,
+                    a.acknowledged_by,
+                    EXISTS (
+                        SELECT 1
+                        FROM ward_twin.assessments AS assessment
+                        WHERE assessment.alert_id = a.alert_id
+                          AND assessment.encounter_id = a.encounter_id
+                    ) AS has_assessment
+                FROM ward_twin.alerts AS a
+                JOIN ward_twin.encounters AS e
+                    ON e.encounter_id = a.encounter_id
+                WHERE e.ward_id = :ward_id
+                  AND e.encounter_id IN :encounter_ids
+            """).bindparams(
+                bindparam("encounter_ids", expanding=True)
+            ),
+            {
+                "ward_id": ward_id,
+                "encounter_ids": encounter_ids,
+            },
+        ).mappings().all()
+
+        for alert in workflow_alerts:
+            workflow_alerts_by_encounter.setdefault(
+                alert["encounter_id"],
+                [],
+            ).append(alert)
+
     # 3. แปลงข้อมูลสำหรับ Frontend
     patients = []
 
     for row in rows:
+        workflow_status = get_workflow_status(
+            workflow_alerts_by_encounter.get(row["encounter_id"], [])
+        )
+
         prediction = {
             "status": "not_available",
             "risk_score": None,
@@ -133,6 +198,8 @@ def get_ward_patients(
                 if row["admitted_at"] is not None
                 else None
             ),
+            "workflow_status": workflow_status,
+            "workflow_status_label": WORKFLOW_STATUS_LABELS[workflow_status],
             "prediction": prediction,
         })
 
