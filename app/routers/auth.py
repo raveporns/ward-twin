@@ -79,8 +79,9 @@ def login(
             password=payload.password,
         )
 
-        # ไม่ออก JWT หากบัญชีไม่มี Ward Access
-        if not user["wards"]:
+        # Admin access is role-scoped; an empty membership claim does not
+        # prevent access to Admin-only endpoints.
+        if user["role"] != "admin" and not user["wards"]:
             raise HTTPException(
                 status_code=403,
                 detail="No ward access assigned",
@@ -96,6 +97,8 @@ def login(
             access_token=access_token,
             token_type="bearer",
             expires_in=1800,
+            role=user["role"],
+            wards=user["accessible_wards"],
         )
 
     except HTTPException:
