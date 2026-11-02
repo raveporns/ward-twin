@@ -1,10 +1,10 @@
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import bindparam, text
-from sqlalchemy.exc import InvalidRequestError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, InvalidRequestError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal, get_db
@@ -78,6 +78,24 @@ class AdminPatientsResponse(BaseModel):
     patients: list[AdminPatientResponse]
 
 
+class WardTransferRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ward_id: str = Field(min_length=1)
+    bed_label: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class WardTransferResponse(BaseModel):
+    encounter_id: str
+    previous_ward_id: str | None
+    new_ward_id: str
+    previous_bed_label: str | None
+    new_bed_label: str
+    transferred: bool
+    transferred_at: datetime | None
+
+
 def get_approval_db():
     """
     Separate database session for approval transactions.
@@ -90,6 +108,208 @@ def get_approval_db():
     """
     with SessionLocal() as db:
         yield db
+
+
+def get_transfer_db():
+    with SessionLocal() as db:
+        yield db
+
+
+def get_integrity_constraint_name(exc: IntegrityError) -> str | None:
+    original = exc.orig
+    diagnostic = getattr(original, "diag", None)
+    return getattr(diagnostic, "constraint_name", None)
+
+
+@router.get("/wards", response_model=list[dict[str, str]])
+def get_admin_wards(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    try:
+        rows = db.execute(
+            text("""
+                SELECT ward_id
+                FROM ward_twin.wards
+                ORDER BY ward_id
+            """)
+        ).mappings().all()
+        return [{"ward_id": str(row["ward_id"])} for row in rows]
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin wards temporarily unavailable",
+        ) from exc
+
+
+@router.patch(
+    "/encounters/{encounter_id}/ward",
+    response_model=WardTransferResponse,
+)
+def transfer_encounter_ward(
+    payload: WardTransferRequest,
+    encounter_id: str = Path(min_length=1),
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(get_transfer_db),
+):
+    ward_id = payload.ward_id.strip()
+    bed_label = payload.bed_label.strip()
+    reason = payload.reason.strip()
+    actor_id = admin.get("sub")
+
+    if not ward_id or not bed_label or not reason:
+        raise HTTPException(
+            status_code=422,
+            detail="ward_id, bed_label, and reason must not be blank",
+        )
+    if not actor_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin identity is required",
+        )
+
+    try:
+        with db.begin():
+            encounter = db.execute(
+                text("""
+                    SELECT
+                        encounter_id,
+                        ward_id,
+                        bed_label,
+                        discharged_at
+                    FROM ward_twin.encounters
+                    WHERE encounter_id = :encounter_id
+                    FOR UPDATE
+                """),
+                {"encounter_id": encounter_id},
+            ).mappings().one_or_none()
+
+            if encounter is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Encounter not found",
+                )
+
+            if encounter["discharged_at"] is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Discharged encounters cannot be transferred",
+                )
+
+            ward_exists = db.execute(
+                text("""
+                    SELECT ward_id
+                    FROM ward_twin.wards
+                    WHERE ward_id = :ward_id
+                    FOR KEY SHARE
+                """),
+                {"ward_id": ward_id},
+            ).scalar_one_or_none()
+
+            if ward_exists is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Ward not found",
+                )
+
+            previous_ward_id = encounter["ward_id"]
+            previous_bed_label = encounter["bed_label"]
+            if (
+                previous_ward_id == ward_id
+                and previous_bed_label == bed_label
+            ):
+                return {
+                    "encounter_id": str(encounter["encounter_id"]),
+                    "previous_ward_id": previous_ward_id,
+                    "new_ward_id": ward_id,
+                    "previous_bed_label": previous_bed_label,
+                    "new_bed_label": bed_label,
+                    "transferred": False,
+                    "transferred_at": None,
+                }
+
+            updated = db.execute(
+                text("""
+                    UPDATE ward_twin.encounters
+                    SET ward_id = :ward_id,
+                        bed_label = :bed_label
+                    WHERE encounter_id = :encounter_id
+                      AND discharged_at IS NULL
+                    RETURNING encounter_id
+                """),
+                {
+                    "ward_id": ward_id,
+                    "bed_label": bed_label,
+                    "encounter_id": encounter_id,
+                },
+            ).mappings().one_or_none()
+
+            if updated is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Encounter changed during transfer",
+                )
+
+            transferred_at = db.execute(
+                text("""
+                    INSERT INTO ward_twin.ward_transfer_history (
+                        encounter_id,
+                        previous_ward_id,
+                        previous_bed_label,
+                        new_ward_id,
+                        new_bed_label,
+                        reason,
+                        transferred_by
+                    )
+                    VALUES (
+                        :encounter_id,
+                        :previous_ward_id,
+                        :previous_bed_label,
+                        :new_ward_id,
+                        :new_bed_label,
+                        :reason,
+                        :transferred_by
+                    )
+                    RETURNING transferred_at
+                """),
+                {
+                    "encounter_id": encounter_id,
+                    "previous_ward_id": previous_ward_id,
+                    "previous_bed_label": previous_bed_label,
+                    "new_ward_id": ward_id,
+                    "new_bed_label": bed_label,
+                    "reason": reason,
+                    "transferred_by": actor_id,
+                },
+            ).scalar_one()
+
+            return {
+                "encounter_id": str(encounter["encounter_id"]),
+                "previous_ward_id": previous_ward_id,
+                "new_ward_id": ward_id,
+                "previous_bed_label": previous_bed_label,
+                "new_bed_label": bed_label,
+                "transferred": True,
+                "transferred_at": transferred_at,
+            }
+
+    except HTTPException:
+        raise
+    except IntegrityError as exc:
+        if get_integrity_constraint_name(exc) == "encounters_active_bed_uq":
+            raise HTTPException(
+                status_code=409,
+                detail="Target bed is already assigned",
+            ) from exc
+        raise HTTPException(
+            status_code=503,
+            detail="Ward transfer could not be completed",
+        ) from exc
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Ward transfer temporarily unavailable",
+        ) from exc
 
 
 @router.get(
