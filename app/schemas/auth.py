@@ -43,22 +43,17 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class LoginResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    expires_in: int
-
-class LoginRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    email: EmailStr
-    password: str
+class LoginWardResponse(BaseModel):
+    ward_id: str
+    name: str
 
 
 class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     expires_in: int
+    role: str
+    wards: list[LoginWardResponse]
 
 
 from typing import Literal

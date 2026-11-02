@@ -3,7 +3,57 @@ from unittest.mock import MagicMock
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from app.services.auth_repository import create_pending_account
+from app.services.auth_repository import (
+    create_pending_account,
+    get_user_accessible_wards,
+)
+
+
+def test_user_accessible_wards_are_limited_to_memberships():
+    db = MagicMock()
+    db.execute.return_value.mappings.return_value.all.return_value = [
+        {"ward_id": "WARD-A", "name": "Ward A"},
+        {"ward_id": "WARD-B", "name": "Ward B"},
+    ]
+
+    wards = get_user_accessible_wards(
+        db,
+        user_id="user-1",
+        role="nurse",
+    )
+
+    assert wards == [
+        {"ward_id": "WARD-A", "name": "Ward A"},
+        {"ward_id": "WARD-B", "name": "Ward B"},
+    ]
+    query = str(db.execute.call_args.args[0])
+    assert "ward_access" in query
+    assert "JOIN ward_twin.wards" in query
+    assert "WHERE wa.user_id = :user_id" in query
+    assert db.execute.call_args.args[1] == {"user_id": "user-1"}
+
+
+def test_admin_accessible_wards_include_full_ward_directory():
+    db = MagicMock()
+    db.execute.return_value.mappings.return_value.all.return_value = [
+        {"ward_id": "WARD-A", "name": "Ward A"},
+        {"ward_id": "WARD-B", "name": "Ward B"},
+    ]
+
+    wards = get_user_accessible_wards(
+        db,
+        user_id="admin-1",
+        role="admin",
+    )
+
+    assert wards == [
+        {"ward_id": "WARD-A", "name": "Ward A"},
+        {"ward_id": "WARD-B", "name": "Ward B"},
+    ]
+    query = str(db.execute.call_args.args[0])
+    assert "FROM ward_twin.wards" in query
+    assert "ward_access" not in query
+    assert db.execute.call_args.args[1:] == ()
 
 
 def test_create_pending_account_commits_all_three_inserts():

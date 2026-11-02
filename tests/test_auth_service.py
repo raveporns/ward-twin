@@ -27,11 +27,13 @@ def make_account(
     }
 
 
-@patch("app.services.auth_service.get_user_ward_ids")
+@patch("app.services.auth_service.get_user_accessible_wards")
 @patch("app.services.auth_service.get_login_account")
-def test_login_success(mock_account, mock_wards):
+def test_login_success(mock_account, mock_accessible_wards):
     mock_account.return_value = make_account()
-    mock_wards.return_value = ["WARD-A"]
+    mock_accessible_wards.return_value = [
+        {"ward_id": "WARD-A", "name": "Ward A"},
+    ]
 
     result = authenticate_user(
         Mock(),
@@ -42,9 +44,12 @@ def test_login_success(mock_account, mock_wards):
     assert result["user_id"] == "test-user-001"
     assert result["role"] == "nurse"
     assert result["wards"] == ["WARD-A"]
+    assert result["accessible_wards"] == [
+        {"ward_id": "WARD-A", "name": "Ward A"},
+    ]
     assert "password_hash" not in result
 
-    mock_wards.assert_called_once()
+    mock_accessible_wards.assert_called_once()
 
 
 @patch("app.services.auth_service.get_login_account")
@@ -117,13 +122,16 @@ def test_login_invalid_role(mock_account):
     assert exc.value.detail == "Account role is not authorized"
 
 
-@patch("app.services.auth_service.get_user_ward_ids")
+@patch("app.services.auth_service.get_user_accessible_wards")
 @patch("app.services.auth_service.get_login_account")
-def test_login_multiple_wards(mock_account, mock_wards):
+def test_login_multiple_wards(mock_account, mock_accessible_wards):
     mock_account.return_value = make_account(
         role="doctor",
     )
-    mock_wards.return_value = ["WARD-A", "WARD-B"]
+    mock_accessible_wards.return_value = [
+        {"ward_id": "WARD-A", "name": "Ward A"},
+        {"ward_id": "WARD-B", "name": "Ward B"},
+    ]
 
     result = authenticate_user(
         Mock(),
@@ -133,3 +141,37 @@ def test_login_multiple_wards(mock_account, mock_wards):
 
     assert result["role"] == "doctor"
     assert result["wards"] == ["WARD-A", "WARD-B"]
+    assert result["accessible_wards"] == [
+        {"ward_id": "WARD-A", "name": "Ward A"},
+        {"ward_id": "WARD-B", "name": "Ward B"},
+    ]
+
+
+@patch("app.services.auth_service.get_user_ward_ids")
+@patch("app.services.auth_service.get_user_accessible_wards")
+@patch("app.services.auth_service.get_login_account")
+def test_admin_uses_all_wards_but_keeps_membership_claims(
+    mock_account,
+    mock_accessible_wards,
+    mock_ward_ids,
+):
+    mock_account.return_value = make_account(role="admin")
+    mock_accessible_wards.return_value = [
+        {"ward_id": "WARD-A", "name": "Ward A"},
+        {"ward_id": "WARD-B", "name": "Ward B"},
+    ]
+    mock_ward_ids.return_value = []
+
+    result = authenticate_user(
+        Mock(),
+        email="admin@example.com",
+        password=TEST_PASSWORD,
+    )
+
+    assert result["role"] == "admin"
+    assert result["wards"] == []
+    assert result["accessible_wards"] == [
+        {"ward_id": "WARD-A", "name": "Ward A"},
+        {"ward_id": "WARD-B", "name": "Ward B"},
+    ]
+    mock_ward_ids.assert_called_once()

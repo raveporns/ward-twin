@@ -112,6 +112,42 @@ def get_user_ward_ids(
     return list(result.scalars().all())
 
 
+def get_user_accessible_wards(
+    db: Session,
+    *,
+    user_id: str,
+    role: str,
+) -> list[dict[str, str]]:
+    if role == "admin":
+        result = db.execute(
+            text("""
+                SELECT ward_id, name
+                FROM ward_twin.wards
+                ORDER BY ward_id
+            """)
+        ).mappings().all()
+    else:
+        result = db.execute(
+            text("""
+                SELECT w.ward_id, w.name
+                FROM ward_twin.ward_access AS wa
+                JOIN ward_twin.wards AS w
+                    ON w.ward_id = wa.ward_id
+                WHERE wa.user_id = :user_id
+                ORDER BY w.ward_id
+            """),
+            {"user_id": user_id},
+        ).mappings().all()
+
+    return [
+        {
+            "ward_id": str(row["ward_id"]),
+            "name": str(row["name"]),
+        }
+        for row in result
+    ]
+
+
 def get_active_user_access(
     db: Session,
     *,

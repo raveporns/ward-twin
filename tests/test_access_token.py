@@ -80,6 +80,19 @@ def test_create_access_token_missing_wards():
         )
 
 
+def test_admin_access_token_allows_empty_membership_claim():
+    token = create_access_token(
+        user_id="admin-user-001",
+        role="admin",
+        wards=[],
+    )
+
+    payload = decode_token(token)
+
+    assert payload["role"] == "admin"
+    assert payload["wards"] == []
+
+
 def test_create_access_token_multiple_wards():
     token = create_access_token(
         user_id="test-user-001",

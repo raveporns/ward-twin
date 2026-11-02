@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.services.auth_repository import (
     get_login_account,
+    get_user_accessible_wards,
     get_user_ward_ids,
 )
 
@@ -61,10 +62,24 @@ def authenticate_user(
             detail="Account role is not authorized",
         )
 
-    ward_ids = get_user_ward_ids(
+    accessible_wards = get_user_accessible_wards(
         db,
         user_id=account["user_id"],
+        role=account["role"],
     )
+
+    if account["role"] == "admin":
+        # Preserve the existing JWT membership claim; Admin's response list
+        # is the full directory because Admin endpoints use all-Ward access.
+        ward_ids = get_user_ward_ids(
+            db,
+            user_id=account["user_id"],
+        )
+    else:
+        ward_ids = [
+            ward["ward_id"]
+            for ward in accessible_wards
+        ]
 
     return {
         "user_id": account["user_id"],
@@ -72,4 +87,5 @@ def authenticate_user(
         "display_name": account["display_name"],
         "role": account["role"],
         "wards": ward_ids,
+        "accessible_wards": accessible_wards,
     }

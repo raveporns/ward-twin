@@ -127,7 +127,7 @@ def create_access_token(
     if not user_id:
         raise ValueError("User ID is required")
 
-    if not wards:
+    if not wards and role != "admin":
         raise ValueError("At least one ward is required")
 
     now = datetime.now(timezone.utc)

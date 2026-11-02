@@ -39,13 +39,28 @@ def approved_user():
         "display_name": "Nurse Example",
         "role": "nurse",
         "wards": ["WARD-A"],
+        "accessible_wards": [
+            {"ward_id": "WARD-A", "name": "Ward A"},
+        ],
     }
 
 
-def test_login_success(client):
+@pytest.mark.parametrize(
+    "role",
+    ["admin", "doctor", "nurse", "viewer"],
+)
+def test_login_success(client, role):
+    user = approved_user()
+    user["role"] = role
+    if role == "admin":
+        user["accessible_wards"] = [
+            {"ward_id": "WARD-A", "name": "Ward A"},
+            {"ward_id": "WARD-B", "name": "Ward B"},
+        ]
+
     with patch(
         "app.routers.auth.authenticate_user",
-        return_value=approved_user(),
+        return_value=user,
     ):
         response = client.post(
             "/api/v1/auth/login",
@@ -58,6 +73,8 @@ def test_login_success(client):
     assert data["token_type"] == "bearer"
     assert data["expires_in"] == 1800
     assert isinstance(data["access_token"], str)
+    assert data["role"] == role
+    assert data["wards"] == user["accessible_wards"]
 
     claims = jwt.decode(
         data["access_token"],
@@ -68,8 +85,8 @@ def test_login_success(client):
     )
 
     assert claims["sub"] == "test-user-001"
-    assert claims["role"] == "nurse"
-    assert claims["wards"] == ["WARD-A"]
+    assert claims["role"] == role
+    assert claims["wards"] == user["wards"]
     assert claims["token_type"] == "access"
 
 
@@ -107,6 +124,7 @@ def test_login_authentication_denied(
 def test_login_no_ward_access(client):
     user = approved_user()
     user["wards"] = []
+    user["accessible_wards"] = []
 
     with patch(
         "app.routers.auth.authenticate_user",
@@ -119,6 +137,98 @@ def test_login_no_ward_access(client):
 
     assert response.status_code == 403
     assert response.json()["detail"] == "No ward access assigned"
+
+
+def test_admin_login_without_membership_lists_all_wards(client):
+    user = approved_user()
+    user["role"] = "admin"
+    user["wards"] = []
+    user["accessible_wards"] = [
+        {"ward_id": "WARD-A", "name": "Ward A"},
+        {"ward_id": "WARD-B", "name": "Ward B"},
+    ]
+
+    with patch(
+        "app.routers.auth.authenticate_user",
+        return_value=user,
+    ):
+        response = client.post(
+            "/api/v1/auth/login",
+            json=login_payload(),
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["role"] == "admin"
+    assert data["wards"] == user["accessible_wards"]
+    claims = jwt.decode(
+        data["access_token"],
+        settings.jwt_secret,
+        algorithms=["HS256"],
+        issuer=settings.jwt_issuer,
+        audience=settings.jwt_audience,
+    )
+    assert claims["wards"] == []
+
+
+def test_login_loads_wards_when_auth_service_omits_enrichment(client):
+    user = approved_user()
+    user.pop("accessible_wards")
+    accessible_wards = [
+        {"ward_id": "WARD-A", "name": "Ward A"},
+        {"ward_id": "WARD-B", "name": "Ward B"},
+    ]
+
+    with (
+        patch(
+            "app.routers.auth.authenticate_user",
+            return_value=user,
+        ),
+        patch(
+            "app.routers.auth.get_user_accessible_wards",
+            return_value=accessible_wards,
+        ) as load_wards,
+    ):
+        response = client.post(
+            "/api/v1/auth/login",
+            json=login_payload(),
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["role"] == "nurse"
+    assert data["wards"] == accessible_wards
+    load_wards.assert_called_once()
+    assert load_wards.call_args.kwargs == {
+        "user_id": "test-user-001",
+        "role": "nurse",
+    }
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["user_id", "role", "wards"],
+)
+def test_login_incomplete_authenticated_user_returns_service_error(
+    client,
+    missing_field,
+):
+    user = approved_user()
+    user.pop(missing_field)
+
+    with patch(
+        "app.routers.auth.authenticate_user",
+        return_value=user,
+    ):
+        response = client.post(
+            "/api/v1/auth/login",
+            json=login_payload(),
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Authentication temporarily unavailable"
+    )
 
 
 def test_login_database_unavailable(client):

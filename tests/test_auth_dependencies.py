@@ -75,6 +75,16 @@ def test_ward_access_uses_database(mock_access):
     assert require_ward("WARD-B", result) == result
 
 
+def test_admin_without_membership_still_cannot_use_ward_scoped_access():
+    with pytest.raises(HTTPException) as exc:
+        require_ward(
+            "WARD-A",
+            {"role": "admin", "wards": []},
+        )
+
+    assert exc.value.status_code == 403
+
+
 def test_require_roles_allows_matching_role():
     user = {"role": "nurse"}
 

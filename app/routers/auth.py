@@ -5,7 +5,10 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.schemas.auth import RegisterRequest, RegisterResponse
-from app.services.auth_repository import create_pending_account
+from app.services.auth_repository import (
+    create_pending_account,
+    get_user_accessible_wards,
+)
 from psycopg import errors as pg_errors
 
 from app.schemas.auth import LoginRequest, LoginResponse
@@ -79,6 +82,22 @@ def login(
             password=payload.password,
         )
 
+        required_user_fields = {"user_id", "role", "wards"}
+        if not required_user_fields.issubset(user):
+            raise HTTPException(
+                status_code=503,
+                detail="Authentication temporarily unavailable",
+            )
+
+        if "accessible_wards" in user:
+            accessible_wards = user["accessible_wards"]
+        else:
+            accessible_wards = get_user_accessible_wards(
+                db,
+                user_id=user["user_id"],
+                role=user["role"],
+            )
+
         # Admin access is role-scoped; an empty membership claim does not
         # prevent access to Admin-only endpoints.
         if user["role"] != "admin" and not user["wards"]:
@@ -98,7 +117,7 @@ def login(
             token_type="bearer",
             expires_in=1800,
             role=user["role"],
-            wards=user["accessible_wards"],
+            wards=accessible_wards,
         )
 
     except HTTPException:
