@@ -88,11 +88,28 @@ def diagnostic(encounter_id="ENC-TEST-A"):
     }
 
 
-def alert(encounter_id, *, state="open", acknowledged_by="staff"):
+def alert(
+    encounter_id,
+    *,
+    alert_id=None,
+    state="open",
+    acknowledged_by="staff",
+    assigned_to=None,
+    assigned_name=None,
+    created_at=None,
+):
     return {
+        "alert_id": alert_id or f"ALT-{encounter_id}",
         "encounter_id": encounter_id,
         "state": state,
+        "created_at": created_at or datetime(
+            2026, 1, 1, tzinfo=timezone.utc
+        ),
         "acknowledged_by": acknowledged_by,
+        "assigned_to": assigned_to,
+        "assigned_name": assigned_name,
+        "claim_status": "claimed" if assigned_to else "unclaimed",
+        "claimed_at": None,
         "has_assessment": True,
     }
 
@@ -353,6 +370,8 @@ def test_response_does_not_expose_extra_database_fields(client):
         "admitted_at",
         "workflow_status",
         "workflow_status_label",
+        "assigned_to",
+        "assigned_name",
         "prediction",
     }
     assert "birth_date" not in patient
@@ -360,6 +379,137 @@ def test_response_does_not_expose_extra_database_fields(client):
     assert "processed_version" not in patient
     assert "unavailable_message" in patient["prediction"]
     assert "missing_features" in patient["prediction"]
+
+
+@pytest.mark.parametrize(
+    "alerts",
+    [
+        [],
+        [
+            alert(
+                "ENC-TEST-A",
+                state="closed",
+                assigned_to="nurse-closed",
+                assigned_name="Closed Alert Nurse",
+            ),
+        ],
+        [
+            alert(
+                "ENC-TEST-A",
+                assigned_to=None,
+                assigned_name="Name without assignee",
+            ),
+        ],
+    ],
+)
+def test_admin_patients_without_assigned_open_alert_returns_nulls(
+    client,
+    alerts,
+):
+    test_client, db = client
+    set_user()
+    successful_db(
+        db,
+        rows=[patient_row()],
+        diagnostics=[diagnostic()],
+        alerts=alerts,
+    )
+
+    response = test_client.get(URL)
+
+    assert response.status_code == 200
+    patient = response.json()["patients"][0]
+    assert patient["assigned_to"] is None
+    assert patient["assigned_name"] is None
+
+
+def test_admin_patients_returns_alert_assignee_and_staff_display_name(client):
+    test_client, db = client
+    set_user()
+    successful_db(
+        db,
+        rows=[patient_row()],
+        diagnostics=[diagnostic()],
+        alerts=[
+            alert(
+                "ENC-TEST-A",
+                assigned_to="nurse-001",
+                assigned_name="พยาบาลทดสอบ",
+            ),
+        ],
+    )
+
+    response = test_client.get(URL)
+
+    assert response.status_code == 200
+    patient = response.json()["patients"][0]
+    assert patient["assigned_to"] == "nurse-001"
+    assert patient["assigned_name"] == "พยาบาลทดสอบ"
+
+
+def test_admin_patients_latest_open_alert_matches_ward_order_without_duplicates(
+    client,
+):
+    test_client, db = client
+    set_user()
+    newest_open = alert(
+        "ENC-TEST-A",
+        alert_id="ALT-NEW",
+        assigned_to="nurse-new",
+        assigned_name="Nurse New",
+        created_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+    )
+    older_open = alert(
+        "ENC-TEST-A",
+        alert_id="ALT-OLD",
+        assigned_to="nurse-old",
+        assigned_name="Nurse Old",
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    successful_db(
+        db,
+        rows=[patient_row()],
+        diagnostics=[diagnostic()],
+        alerts=[newest_open, older_open],
+    )
+
+    response = test_client.get(URL)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert len(body["patients"]) == 1
+    patient = body["patients"][0]
+    assert patient["assigned_to"] == "nurse-new"
+    assert patient["assigned_name"] == "Nurse New"
+    alert_query = str(db.execute.call_args_list[3].args[0])
+    assert "(a.state = 'open') DESC" in alert_query
+    assert "a.created_at DESC NULLS LAST" in alert_query
+    assert "a.alert_id DESC" in alert_query
+
+
+def test_admin_patients_keeps_assignee_when_staff_profile_name_is_missing(client):
+    test_client, db = client
+    set_user()
+    successful_db(
+        db,
+        rows=[patient_row()],
+        diagnostics=[diagnostic()],
+        alerts=[
+            alert(
+                "ENC-TEST-A",
+                assigned_to="nurse-no-profile",
+                assigned_name=None,
+            ),
+        ],
+    )
+
+    response = test_client.get(URL)
+
+    assert response.status_code == 200
+    patient = response.json()["patients"][0]
+    assert patient["assigned_to"] == "nurse-no-profile"
+    assert patient["assigned_name"] is None
 
 
 def test_invalid_pagination_is_rejected(client):

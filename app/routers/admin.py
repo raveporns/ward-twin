@@ -18,6 +18,7 @@ from app.services.admin_repository import (
     approve_account,
     list_pending_accounts,
 )
+from app.services.alert_workflow import get_alert_workflow_data
 from app.services.patient_response import (
     WORKFLOW_STATUS_LABELS,
     build_patient_prediction,
@@ -68,6 +69,8 @@ class AdminPatientResponse(BaseModel):
     admitted_at: datetime | None = None
     workflow_status: str
     workflow_status_label: str
+    assigned_to: str | None = None
+    assigned_name: str | None = None
     prediction: AdminPatientPredictionResponse
 
 
@@ -435,33 +438,13 @@ def get_admin_patients(
             as_of=diagnostics_as_of,
         )
 
-        workflow_alerts_by_encounter = {}
-        if encounter_ids:
-            workflow_alerts = db.execute(
-                text("""
-                    SELECT
-                        a.encounter_id,
-                        a.state,
-                        a.acknowledged_by,
-                        EXISTS (
-                            SELECT 1
-                            FROM ward_twin.assessments AS assessment
-                            WHERE assessment.alert_id = a.alert_id
-                              AND assessment.encounter_id = a.encounter_id
-                        ) AS has_assessment
-                    FROM ward_twin.alerts AS a
-                    WHERE a.encounter_id IN :encounter_ids
-                """).bindparams(
-                    bindparam("encounter_ids", expanding=True)
-                ),
-                {"encounter_ids": encounter_ids},
-            ).mappings().all()
-
-            for alert in workflow_alerts:
-                workflow_alerts_by_encounter.setdefault(
-                    alert["encounter_id"],
-                    [],
-                ).append(alert)
+        (
+            workflow_alerts_by_encounter,
+            current_alert_by_encounter,
+        ) = get_alert_workflow_data(
+            db,
+            encounter_ids=encounter_ids,
+        )
 
         feature_columns = load_model_metadata()["feature_columns"]
         patients = []
@@ -478,6 +461,9 @@ def get_admin_patients(
             workflow_status = get_workflow_status(
                 workflow_alerts_by_encounter.get(row["encounter_id"], [])
             )
+            current_alert = current_alert_by_encounter.get(
+                row["encounter_id"]
+            )
             patients.append({
                 "patient_id": row["patient_id"],
                 "hn": row["hn"],
@@ -491,6 +477,18 @@ def get_admin_patients(
                 "admitted_at": row["admitted_at"],
                 "workflow_status": workflow_status,
                 "workflow_status_label": WORKFLOW_STATUS_LABELS[workflow_status],
+                "assigned_to": (
+                    str(current_alert["assigned_to"])
+                    if current_alert is not None
+                    and current_alert["assigned_to"] is not None
+                    else None
+                ),
+                "assigned_name": (
+                    current_alert["assigned_name"]
+                    if current_alert is not None
+                    and current_alert["assigned_to"] is not None
+                    else None
+                ),
                 "prediction": prediction,
             })
 
