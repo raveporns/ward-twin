@@ -2,6 +2,7 @@
 from fastapi import FastAPI
 
 from app.core.config import settings
+from app.core.middleware import JsonUtf8CharsetMiddleware
 
 from app.routers import (
     assessments,
@@ -60,6 +61,7 @@ app = FastAPI(
     ),
     lifespan=lifespan,
 )
+app.add_middleware(JsonUtf8CharsetMiddleware)
 
 
 # ============================================================

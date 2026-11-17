@@ -1,10 +1,11 @@
 
 from datetime import datetime, timezone
-from uuid import UUID
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -58,6 +59,13 @@ class AlertAcknowledgementResponse(BaseModel):
     assigned_to: str | None = None
     acknowledged_by: str | None = None
     acknowledged_at: datetime | None = None
+
+
+class AlertClaimResponse(BaseModel):
+    alert_id: str
+    status: Literal["claimed"]
+    assigned_to: str
+    claimed_at: datetime
 
 
 # ============================================================
@@ -297,11 +305,15 @@ def acknowledge_alert(
         require_roles("admin", "doctor", "nurse")
     ),
 ):
-    try:
-        # ----------------------------------------------------
-        # 1. Lock alert row
-        # ----------------------------------------------------
+    actor_id = user.get("sub")
+    if not actor_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Authenticated user identity is required",
+        )
+    actor_id = str(actor_id)
 
+    try:
         alert = db.execute(
             text("""
                 SELECT
@@ -310,7 +322,10 @@ def acknowledge_alert(
                     e.ward_id,
                     a.state,
                     a.acknowledged_by,
-                    a.assigned_to
+                    a.acknowledged_at,
+                    a.assigned_to,
+                    a.claim_status,
+                    a.claimed_at
                 FROM ward_twin.alerts AS a
                 JOIN ward_twin.encounters AS e
                     ON e.encounter_id = a.encounter_id
@@ -328,18 +343,30 @@ def acknowledge_alert(
                 detail="Alert not found",
             )
 
-        # ----------------------------------------------------
-        # 2. Ward authorization
-        # ----------------------------------------------------
+        require_ward(alert["ward_id"], user)
 
-        require_ward(
-            alert["ward_id"],
-            user,
-        )
+        if payload.assigned_to and str(payload.assigned_to) != actor_id:
+            raise HTTPException(
+                status_code=422,
+                detail="Acknowledgement cannot change the alert assignee",
+            )
 
-        # ----------------------------------------------------
-        # 3. Validate alert state
-        # ----------------------------------------------------
+        # Preserve idempotency for records acknowledged before claims existed.
+        if alert["acknowledged_by"] is not None:
+            if str(alert["acknowledged_by"]) != actor_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Alert was acknowledged by another user",
+                )
+            db.commit()
+            return serialize_alert({
+                "alert_id": alert["alert_id"],
+                "encounter_id": alert["encounter_id"],
+                "state": alert["state"],
+                "assigned_to": alert["assigned_to"],
+                "acknowledged_by": alert["acknowledged_by"],
+                "acknowledged_at": alert["acknowledged_at"],
+            })
 
         if alert["state"] != "open":
             raise HTTPException(
@@ -347,77 +374,37 @@ def acknowledge_alert(
                 detail="Alert is not open",
             )
 
-        if alert["acknowledged_by"] is not None:
+        if user.get("role") != "nurse":
             raise HTTPException(
-                status_code=409,
-                detail="Alert already acknowledged",
+                status_code=403,
+                detail="Only the claiming nurse can acknowledge this alert",
             )
 
-        # ----------------------------------------------------
-        # 4. Resolve actor and assignment
-        # ----------------------------------------------------
-
-        actor_id = str(user["sub"])
-
-        assigned_to = (
-            payload.assigned_to
-            or alert["assigned_to"]
-            or actor_id
-        )
-
-        assigned_to = str(assigned_to)
-
-        # ----------------------------------------------------
-        # 5. Validate current staff
-        # ----------------------------------------------------
-
-        if not staff_exists(
-            db=db,
-            user_id=actor_id,
+        if (
+            alert["claim_status"] != "claimed"
+            or alert["assigned_to"] is None
+            or str(alert["assigned_to"]) != actor_id
         ):
+            raise HTTPException(
+                status_code=403,
+                detail="Alert must be claimed by the current nurse first",
+            )
+
+        if not staff_exists(db=db, user_id=actor_id):
             raise HTTPException(
                 status_code=403,
                 detail="Current user is not registered staff",
             )
 
-        # ----------------------------------------------------
-        # 6. Validate assigned staff
-        # ----------------------------------------------------
-
-        if not staff_exists(
-            db=db,
-            user_id=assigned_to,
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail="Assigned staff not found",
-            )
-
-        # ----------------------------------------------------
-        # 7. Restrict assignment to self
-        # ----------------------------------------------------
-
-        if assigned_to != actor_id:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Assigning another staff member requires "
-                    "ward membership verification"
-                ),
-            )
-
-        # ----------------------------------------------------
-        # 8. Acknowledge alert
-        # ----------------------------------------------------
-
         result = db.execute(
             text("""
                 UPDATE ward_twin.alerts
-                SET
-                    assigned_to = :assigned_to,
-                    acknowledged_by = :actor_id,
+                SET acknowledged_by = :actor_id,
                     acknowledged_at = :acknowledged_at
                 WHERE alert_id = :alert_id
+                  AND claim_status = 'claimed'
+                  AND assigned_to = :actor_id
+                  AND acknowledged_by IS NULL
                 RETURNING
                     alert_id,
                     encounter_id,
@@ -428,15 +415,16 @@ def acknowledge_alert(
             """),
             {
                 "alert_id": alert_id,
-                "assigned_to": assigned_to,
                 "actor_id": actor_id,
                 "acknowledged_at": datetime.now(timezone.utc),
             },
-        ).mappings().one()
+        ).mappings().one_or_none()
 
-        # ----------------------------------------------------
-        # 9. Commit transaction
-        # ----------------------------------------------------
+        if result is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Alert acknowledgement changed concurrently",
+            )
 
         db.commit()
 
@@ -446,6 +434,152 @@ def acknowledge_alert(
         db.rollback()
         raise
 
-    except Exception:
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Alert acknowledgement temporarily unavailable",
+        ) from exc
+
+
+@router.post(
+    "/alerts/{alert_id}/claim",
+    response_model=AlertClaimResponse,
+    summary="Claim Alert Task",
+    description=(
+        "พยาบาลรับผิดชอบ Alert ใน Ward ที่ตนมีสิทธิ์ "
+        "การ Claim แยกจากการรับทราบ Alert"
+    ),
+    responses={
+        401: {"description": "Authentication required"},
+        403: {"description": "Nurse role or Ward access required"},
+        404: {"description": "Alert not found"},
+        409: {"description": "Alert is closed or claimed by another nurse"},
+        503: {"description": "Claim temporarily unavailable"},
+    },
+)
+def claim_alert(
+    alert_id: str,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_roles("nurse")),
+):
+    actor_id = user.get("sub")
+    if not actor_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Authenticated user identity is required",
+        )
+    actor_id = str(actor_id)
+
+    try:
+        alert = db.execute(
+            text("""
+                SELECT
+                    a.alert_id,
+                    a.state,
+                    a.assigned_to,
+                    a.acknowledged_by,
+                    a.claim_status,
+                    a.claimed_at,
+                    e.ward_id
+                FROM ward_twin.alerts AS a
+                JOIN ward_twin.encounters AS e
+                    ON e.encounter_id = a.encounter_id
+                WHERE a.alert_id = :alert_id
+                FOR UPDATE OF a
+            """),
+            {"alert_id": alert_id},
+        ).mappings().one_or_none()
+
+        if alert is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Alert not found",
+            )
+
+        require_ward(alert["ward_id"], user)
+
+        if alert["claim_status"] == "claimed":
+            if str(alert["assigned_to"]) != actor_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Alert is claimed by another nurse",
+                )
+
+            db.commit()
+            return {
+                "alert_id": str(alert["alert_id"]),
+                "status": "claimed",
+                "assigned_to": actor_id,
+                "claimed_at": alert["claimed_at"],
+            }
+
+        if alert["acknowledged_by"] is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Acknowledged legacy alerts cannot be claimed",
+            )
+
+        if alert["state"] != "open":
+            raise HTTPException(
+                status_code=409,
+                detail="Alert is not open",
+            )
+
+        if (
+            alert["assigned_to"] is not None
+            and str(alert["assigned_to"]) != actor_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Alert is assigned to another nurse",
+            )
+
+        claimed = db.execute(
+            text("""
+                UPDATE ward_twin.alerts
+                SET assigned_to = :assigned_to,
+                    claim_status = 'claimed',
+                    claimed_at = CURRENT_TIMESTAMP
+                WHERE alert_id = :alert_id
+                  AND claim_status = 'unclaimed'
+                  AND state = 'open'
+                  AND (
+                      assigned_to IS NULL
+                      OR assigned_to = :assigned_to
+                  )
+                RETURNING
+                    alert_id,
+                    claim_status,
+                    assigned_to,
+                    claimed_at
+            """),
+            {
+                "alert_id": alert_id,
+                "assigned_to": actor_id,
+            },
+        ).mappings().one_or_none()
+
+        if claimed is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Alert claim changed concurrently",
+            )
+
+        db.commit()
+        return {
+            "alert_id": str(claimed["alert_id"]),
+            "status": claimed["claim_status"],
+            "assigned_to": str(claimed["assigned_to"]),
+            "claimed_at": claimed["claimed_at"],
+        }
+
+    except HTTPException:
         db.rollback()
         raise
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Alert claim temporarily unavailable",
+        ) from exc

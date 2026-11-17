@@ -8,6 +8,7 @@ from app.core.database import get_db
 from app.dependencies.auth import get_current_user
 from app.main import app
 from app.ml.model_loader import load_model_metadata
+from app.services.patient_response import get_workflow_status
 
 
 WARD_ID = "WARD-TEST"
@@ -75,12 +76,22 @@ def alert_row(
     acknowledged_by="nurse-test",
     has_assessment=True,
     encounter_id=ENCOUNTER_ID,
+    assigned_to=None,
+    assigned_name=None,
+    claim_status="unclaimed",
+    claimed_at=None,
+    created_at=None,
 ):
     return {
         "alert_id": alert_id,
         "encounter_id": encounter_id,
         "state": state,
+        "created_at": created_at,
         "acknowledged_by": acknowledged_by,
+        "assigned_to": assigned_to,
+        "assigned_name": assigned_name,
+        "claim_status": claim_status,
+        "claimed_at": claimed_at,
         "has_assessment": has_assessment,
     }
 
@@ -184,6 +195,79 @@ def test_ward_patients_workflow_status(
     patient = response.json()["patients"][0]
     assert patient["workflow_status"] == expected_status
     assert patient["workflow_status_label"] == expected_label
+
+
+def test_claimed_alert_keeps_pending_acknowledgement_and_exposes_owner(client):
+    claimed_at = datetime(2026, 11, 17, 10, 0, tzinfo=timezone.utc)
+    response, _ = request_patients(
+        client,
+        [
+            alert_row(
+                "ALT-CLAIMED",
+                acknowledged_by=None,
+                assigned_to="nurse-test",
+                assigned_name="Nurse Test",
+                claim_status="claimed",
+                claimed_at=claimed_at,
+            )
+        ],
+    )
+
+    patient = response.json()["patients"][0]
+    assert patient["workflow_status"] == "pending_acknowledgement"
+    assert patient["assigned_to"] == "nurse-test"
+    assert patient["assigned_name"] == "Nurse Test"
+    assert patient["claim_status"] == "claimed"
+    assert patient["claimed_at"] == "2026-11-17T10:00:00+00:00"
+
+
+def test_patient_list_uses_latest_open_alert_for_claim_fields(client):
+    response, _ = request_patients(
+        client,
+        [
+            alert_row(
+                "ALT-NEWER",
+                acknowledged_by=None,
+                assigned_to="nurse-new",
+                assigned_name="New Owner",
+                claim_status="claimed",
+                created_at=datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc),
+            ),
+            alert_row(
+                "ALT-OLDER",
+                acknowledged_by=None,
+                assigned_to="nurse-old",
+                assigned_name="Old Owner",
+                claim_status="claimed",
+                created_at=datetime(2026, 11, 17, 11, 0, tzinfo=timezone.utc),
+            ),
+        ],
+    )
+
+    patient = response.json()["patients"][0]
+    assert patient["workflow_status"] == "pending_acknowledgement"
+    assert patient["assigned_to"] == "nurse-new"
+    assert patient["assigned_name"] == "New Owner"
+
+
+def test_claim_acknowledgement_assessment_workflow_sequence():
+    alert = {
+        "state": "open",
+        "acknowledged_by": None,
+        "has_assessment": False,
+        "claim_status": "unclaimed",
+    }
+
+    assert get_workflow_status([alert]) == "pending_acknowledgement"
+
+    alert["claim_status"] = "claimed"
+    assert get_workflow_status([alert]) == "pending_acknowledgement"
+
+    alert["acknowledged_by"] = "nurse-test"
+    assert get_workflow_status([alert]) == "pending_assessment"
+
+    alert["has_assessment"] = True
+    assert get_workflow_status([alert]) == "assessed"
 
 
 def test_no_observations_has_model_features_missing_diagnostics(client):
@@ -384,8 +468,7 @@ def test_ward_patients_response_is_valid_utf8_with_thai_text(client):
     content_type = response.headers["content-type"].lower()
 
     assert response.status_code == 200
-    assert content_type.split(";", maxsplit=1)[0] == "application/json"
-    assert "charset=" not in content_type or "charset=utf-8" in content_type
+    assert content_type == "application/json; charset=utf-8"
     assert thai_name in decoded_body
     assert thai_name.encode("utf-8") in response.content
     assert "à¸" not in decoded_body
@@ -404,7 +487,8 @@ def test_assessment_for_another_alert_does_not_count(client):
     workflow_query = str(db.execute.call_args_list[3].args[0])
     assert "assessment.alert_id = a.alert_id" in workflow_query
     assert "assessment.encounter_id = a.encounter_id" in workflow_query
-    assert "e.ward_id = :ward_id" in workflow_query
+    assert "a.encounter_id IN" in workflow_query
+    assert "encounter_ids" in workflow_query
 
 
 def test_ward_patients_preserve_existing_response_and_get_is_read_only(client):
@@ -427,6 +511,10 @@ def test_ward_patients_preserve_existing_response_and_get_is_read_only(client):
         "admitted_at": "2026-01-01T00:00:00+00:00",
         "workflow_status": "normal",
         "workflow_status_label": "ไม่มีรายการรอดำเนินการ",
+        "assigned_to": None,
+        "assigned_name": None,
+        "claim_status": None,
+        "claimed_at": None,
         "prediction": {
             "status": "not_available",
             "risk_score": None,

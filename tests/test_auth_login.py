@@ -68,6 +68,9 @@ def test_login_success(client, role):
         )
 
     assert response.status_code == 200
+    assert response.headers["content-type"] == (
+        "application/json; charset=utf-8"
+    )
 
     data = response.json()
     assert data["token_type"] == "bearer"
@@ -118,6 +121,9 @@ def test_login_authentication_denied(
         )
 
     assert response.status_code == status_code
+    assert response.headers["content-type"] == (
+        "application/json; charset=utf-8"
+    )
     assert response.json()["detail"] == detail
 
 

@@ -4,7 +4,7 @@ from collections import Counter
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import bindparam, text
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -16,6 +16,7 @@ from app.services.patient_response import (
     get_patient_diagnostics,
     get_workflow_status,
 )
+from app.services.alert_workflow import get_alert_workflow_data
 
 router = APIRouter(tags=["Screens"])
 logger = logging.getLogger(__name__)
@@ -93,40 +94,14 @@ def get_ward_patients(
         as_of=diagnostic_as_of,
     )
 
-    workflow_alerts_by_encounter = {}
-    if rows:
-        encounter_ids = [row["encounter_id"] for row in rows]
-        workflow_alerts = db.execute(
-            text("""
-                SELECT
-                    a.encounter_id,
-                    a.state,
-                    a.acknowledged_by,
-                    EXISTS (
-                        SELECT 1
-                        FROM ward_twin.assessments AS assessment
-                        WHERE assessment.alert_id = a.alert_id
-                          AND assessment.encounter_id = a.encounter_id
-                    ) AS has_assessment
-                FROM ward_twin.alerts AS a
-                JOIN ward_twin.encounters AS e
-                    ON e.encounter_id = a.encounter_id
-                WHERE e.ward_id = :ward_id
-                  AND e.encounter_id IN :encounter_ids
-            """).bindparams(
-                bindparam("encounter_ids", expanding=True)
-            ),
-            {
-                "ward_id": ward_id,
-                "encounter_ids": encounter_ids,
-            },
-        ).mappings().all()
-
-        for alert in workflow_alerts:
-            workflow_alerts_by_encounter.setdefault(
-                alert["encounter_id"],
-                [],
-            ).append(alert)
+    encounter_ids = [row["encounter_id"] for row in rows]
+    (
+        workflow_alerts_by_encounter,
+        current_alert_by_encounter,
+    ) = get_alert_workflow_data(
+        db,
+        encounter_ids=encounter_ids,
+    )
 
     # 3. แปลงข้อมูลสำหรับ Frontend
     patients = []
@@ -136,6 +111,9 @@ def get_ward_patients(
     for row in rows:
         workflow_status = get_workflow_status(
             workflow_alerts_by_encounter.get(row["encounter_id"], [])
+        )
+        current_alert = current_alert_by_encounter.get(
+            row["encounter_id"]
         )
         diagnostic = diagnostics_by_encounter.get(
             row["encounter_id"],
@@ -167,6 +145,27 @@ def get_ward_patients(
             ),
             "workflow_status": workflow_status,
             "workflow_status_label": WORKFLOW_STATUS_LABELS[workflow_status],
+            "assigned_to": (
+                str(current_alert["assigned_to"])
+                if current_alert is not None
+                and current_alert["assigned_to"] is not None
+                else None
+            ),
+            "assigned_name": (
+                current_alert["assigned_name"]
+                if current_alert is not None
+                else None
+            ),
+            "claim_status": (
+                current_alert["claim_status"]
+                if current_alert is not None
+                else None
+            ),
+            "claimed_at": (
+                current_alert["claimed_at"]
+                if current_alert is not None
+                else None
+            ),
             "prediction": prediction,
         })
 

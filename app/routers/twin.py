@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.dependencies.auth import require_roles, require_ward
+from app.services.alert_workflow import get_alert_workflow_data
 
 
 router = APIRouter(tags=["Digital Twin"])
@@ -57,10 +58,19 @@ class TwinPredictionResponse(BaseModel):
     unavailable_reason: str | None = None
 
 
+class TwinCurrentAlertResponse(BaseModel):
+    alert_id: str
+    assigned_to: str | None = None
+    assigned_name: str | None = None
+    claim_status: str
+    claimed_at: datetime | None = None
+
+
 class PatientTwinResponse(BaseModel):
     encounter: EncounterTwinResponse
     latest_vitals: list[VitalSignResponse]
     prediction: TwinPredictionResponse
+    current_alert: TwinCurrentAlertResponse | None = None
 
 
 # ============================================================
@@ -311,6 +321,12 @@ def get_patient_twin(
         latest_prediction=latest_prediction,
     )
 
+    _, current_alerts = get_alert_workflow_data(
+        db,
+        encounter_ids=[encounter_id],
+    )
+    current_alert = current_alerts.get(encounter_id)
+
     # --------------------------------------------------------
     # 9. Return Digital Twin
     # --------------------------------------------------------
@@ -319,4 +335,19 @@ def get_patient_twin(
         "encounter": encounter_data,
         "latest_vitals": latest_vitals,
         "prediction": prediction_data,
+        "current_alert": (
+            {
+                "alert_id": str(current_alert["alert_id"]),
+                "assigned_to": (
+                    str(current_alert["assigned_to"])
+                    if current_alert["assigned_to"] is not None
+                    else None
+                ),
+                "assigned_name": current_alert["assigned_name"],
+                "claim_status": current_alert["claim_status"],
+                "claimed_at": current_alert["claimed_at"],
+            }
+            if current_alert is not None
+            else None
+        ),
     }

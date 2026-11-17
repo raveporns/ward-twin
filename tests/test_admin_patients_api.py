@@ -134,6 +134,10 @@ def test_admin_without_ward_membership_can_read_multiple_wards(client):
     response = test_client.get(URL)
 
     assert response.status_code == 200
+    assert response.headers["content-type"] == (
+        "application/json; charset=utf-8"
+    )
+    assert "ผู้ป่วยจำลอง PAT-TEST-A".encode("utf-8") in response.content
     body = response.json()
     assert body["total"] == 2
     assert {patient["ward_id"] for patient in body["patients"]} == {
