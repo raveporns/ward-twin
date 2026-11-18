@@ -17,6 +17,7 @@ from app.routers import (
     imports,
     alerts,
     auth,
+    users,
 )
 
 from app.routers.admin import router as admin_router
@@ -180,6 +181,15 @@ app.include_router(
 
 app.include_router(
     auth.router,
+    prefix="/api/v1",
+)
+
+app.include_router(
+    users.router,
+    prefix="/api/v1",
+)
+app.include_router(
+    users.admin_router,
     prefix="/api/v1",
 )
 
