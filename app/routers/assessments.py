@@ -50,6 +50,7 @@ class AssessmentResponse(BaseModel):
     client_record_id: UUID
     note: str
     created_by: str
+    assessed_by_name: str | None = None
     created_at: datetime | None = None
 
 
@@ -438,18 +439,35 @@ def get_assessments(
     rows = db.execute(
         text("""
             SELECT
-                assessment_id,
-                encounter_id,
-                alert_id,
-                client_record_id,
-                note,
-                created_by,
-                created_at
-            FROM ward_twin.assessments
-            WHERE encounter_id = :encounter_id
+                assessment.assessment_id,
+                assessment.encounter_id,
+                assessment.alert_id,
+                assessment.client_record_id,
+                assessment.note,
+                assessment.created_by,
+                assessor.display_name AS assessed_by_name,
+                assessment.created_at
+            FROM ward_twin.assessments AS assessment
+            LEFT JOIN LATERAL (
+                SELECT staff.display_name
+                FROM ward_twin.staff_profiles AS staff
+                WHERE staff.user_id::text = assessment.created_by::text
+                   OR to_jsonb(staff)->>'auth_user_id'
+                        = assessment.created_by::text
+                ORDER BY
+                    CASE
+                        WHEN staff.user_id::text
+                            = assessment.created_by::text
+                        THEN 0
+                        ELSE 1
+                    END,
+                    staff.user_id
+                LIMIT 1
+            ) AS assessor ON TRUE
+            WHERE assessment.encounter_id = :encounter_id
             ORDER BY
-                created_at DESC,
-                assessment_id DESC
+                assessment.created_at DESC,
+                assessment.assessment_id DESC
         """),
         {
             "encounter_id": encounter_id,

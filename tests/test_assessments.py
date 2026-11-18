@@ -43,6 +43,7 @@ def stored_row(note="Test assessment"):
         "client_record_id": UUID(RECORD_ID),
         "note": note,
         "created_by": "nurseA1",
+        "assessed_by_name": None,
         "created_at": None,
     }
 
@@ -166,9 +167,11 @@ def test_create_assessment_conflict(mock_db):
 
 
 def test_get_assessments_success(mock_db):
+    row = stored_row()
+    row["assessed_by_name"] = "พยาบาล A1"
     mock_db.execute.side_effect = [
         query_result(one={"encounter_id": ENCOUNTER, "ward_id": "WARD-A"}),
-        query_result(all_rows=[stored_row()]),
+        query_result(all_rows=[row]),
     ]
 
     app.dependency_overrides[get_current_user] = lambda: {
@@ -184,9 +187,126 @@ def test_get_assessments_success(mock_db):
         )
 
         assert response.status_code == 200
+        assert response.headers["content-type"] == (
+            "application/json; charset=utf-8"
+        )
         assert len(response.json()["assessments"]) == 1
+        item = response.json()["assessments"][0]
+        assert item["created_by"] == "nurseA1"
+        assert item["assessed_by_name"] == "พยาบาล A1"
+        assert set(item) == {
+            "assessment_id",
+            "encounter_id",
+            "alert_id",
+            "client_record_id",
+            "note",
+            "created_by",
+            "assessed_by_name",
+            "created_at",
+        }
+        assert "พยาบาล A1".encode("utf-8") in response.content
     finally:
         app.dependency_overrides.pop(get_current_user, None)
+
+
+@pytest.mark.parametrize(
+    ("created_by", "display_name", "match_column"),
+    [
+        ("nurseA1", "พยาบาล A1", "staff.user_id::text"),
+        ("ADMIN-001", "ผู้ดูแลระบบ", "staff.user_id::text"),
+        (
+            "206b9dd7-ddef-414c-a570-393417f43bfd",
+            "แพทย์ UUID",
+            "auth_user_id",
+        ),
+    ],
+)
+def test_get_assessments_resolves_assessor_by_exact_identifier(
+    mock_db,
+    created_by,
+    display_name,
+    match_column,
+):
+    row = stored_row()
+    row["created_by"] = created_by
+    row["assessed_by_name"] = display_name
+    mock_db.execute.side_effect = [
+        query_result(one={"encounter_id": ENCOUNTER, "ward_id": "WARD-A"}),
+        query_result(all_rows=[row]),
+    ]
+
+    response = client.get(
+        f"{BASE}/encounters/{ENCOUNTER}/assessments",
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    assessment = response.json()["assessments"][0]
+    assert assessment["created_by"] == created_by
+    assert assessment["assessed_by_name"] == display_name
+    sql = str(mock_db.execute.call_args_list[1].args[0])
+    assert "LEFT JOIN LATERAL" in sql
+    assert match_column in sql
+    assert "LIMIT 1" in sql
+
+
+def test_get_assessments_missing_assessor_returns_null_without_dropping_id(
+    mock_db,
+):
+    row = stored_row()
+    row["assessed_by_name"] = None
+    mock_db.execute.side_effect = [
+        query_result(one={"encounter_id": ENCOUNTER, "ward_id": "WARD-A"}),
+        query_result(all_rows=[row]),
+    ]
+
+    response = client.get(
+        f"{BASE}/encounters/{ENCOUNTER}/assessments",
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    assessment = response.json()["assessments"][0]
+    assert assessment["created_by"] == "nurseA1"
+    assert assessment["assessed_by_name"] is None
+
+
+def test_multiple_assessments_remain_distinct_and_ordered(mock_db):
+    newest = stored_row("Newest")
+    newest["assessment_id"] = UUID(
+        "306b9dd7-ddef-414c-a570-393417f43bfd"
+    )
+    newest["assessed_by_name"] = "พยาบาลใหม่"
+    oldest = stored_row("Oldest")
+    oldest["assessed_by_name"] = "พยาบาลเก่า"
+    mock_db.execute.side_effect = [
+        query_result(one={"encounter_id": ENCOUNTER, "ward_id": "WARD-A"}),
+        query_result(all_rows=[newest, oldest]),
+    ]
+
+    response = client.get(
+        f"{BASE}/encounters/{ENCOUNTER}/assessments",
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    assessments = response.json()["assessments"]
+    assert len(assessments) == 2
+    assert [item["note"] for item in assessments] == ["Newest", "Oldest"]
+    assert [item["assessed_by_name"] for item in assessments] == [
+        "พยาบาลใหม่",
+        "พยาบาลเก่า",
+    ]
+    assert len({item["assessment_id"] for item in assessments}) == 2
+
+
+def test_get_assessments_requires_jwt(mock_db):
+    response = client.get(
+        f"{BASE}/encounters/{ENCOUNTER}/assessments",
+    )
+
+    assert response.status_code == 401
+    mock_db.execute.assert_not_called()
 
 
 def test_get_assessments_wrong_ward(mock_db):
