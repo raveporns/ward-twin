@@ -18,6 +18,8 @@ router = APIRouter(tags=["Import Templates"])
 
 class ImportTemplateKind(str, Enum):
     encounters = "encounters"
+    observations = "observations"
+    outcomes = "outcomes"
 
 
 TEMPLATES = {
@@ -33,6 +35,21 @@ TEMPLATES = {
         "bed_label",
         "admitted_at",
     ],
+    ImportTemplateKind.observations: [
+        "reading_id",
+        "encounter_id",
+        "measured_at",
+        "metric",
+        "value",
+        "unit",
+    ],
+    ImportTemplateKind.outcomes: [
+        "event_id",
+        "encounter_id",
+        "event_type",
+        "event_at",
+        "unplanned",
+    ],
 }
 
 
@@ -45,7 +62,7 @@ TEMPLATES = {
     summary="Download CSV Import Template",
     description=(
         "ดาวน์โหลดไฟล์ CSV Template สำหรับนำเข้าข้อมูล "
-        "ปัจจุบันรองรับประเภท encounters เท่านั้น "
+        "รองรับประเภท encounters, observations และ outcomes "
         "อนุญาตเฉพาะผู้ใช้ Role admin หรือ nurse "
         "ผู้ใช้ต้องเข้าสู่ระบบด้วย Bearer JWT"
     ),
