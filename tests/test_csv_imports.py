@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 from uuid import uuid4
 from unittest.mock import MagicMock
@@ -62,11 +63,11 @@ def upload(client, csv_content, kind=None, ward_id=None):
     )
 
 
-def encounter_csv():
+def encounter_csv(birth_date=""):
     return (
         "patient_id,hn,display_name,birth_date,sex,encounter_id,"
         "an,ward_id,bed_label,admitted_at\n"
-        "PAT-TEST,HN-TEST,ผู้ป่วยทดสอบ,,,ENC-TEST,,WARD-A,"
+        f"PAT-TEST,HN-TEST,ผู้ป่วยทดสอบ,{birth_date},,ENC-TEST,,WARD-A,"
         "A-01,2026-11-20T08:00:00+07:00\n"
     )
 
@@ -86,6 +87,52 @@ def test_old_encounters_upload_defaults_to_encounters(import_client):
     )
     assert job_insert["kind"] == "encounters"
     assert db.commit.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("input_date", "expected_date"),
+    [
+        ("21/11/2026", "2026-11-21"),
+        ("2026-11-21", "2026-11-21"),
+    ],
+)
+def test_encounter_birth_date_is_normalized_before_staging(
+    import_client,
+    input_date,
+    expected_date,
+):
+    client, _, _, statements = import_client
+
+    response = upload(client, encounter_csv(input_date))
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "validated"
+    row_insert = next(
+        params for sql, params in statements
+        if "INSERT INTO ward_twin.import_rows" in sql
+    )
+    assert row_insert["row_number"] == 2
+    assert json.loads(row_insert["payload"])["birth_date"] == expected_date
+
+
+def test_invalid_encounter_birth_date_is_staged_with_row_number(import_client):
+    client, _, _, statements = import_client
+
+    response = upload(client, encounter_csv("31/02/2026"))
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "invalid"
+    assert response.json()["valid_rows"] == 0
+    assert response.json()["error_rows"] == 1
+    row_insert = next(
+        params for sql, params in statements
+        if "INSERT INTO ward_twin.import_rows" in sql
+    )
+    assert row_insert["row_number"] == 2
+    assert (
+        "Invalid birth_date; use DD/MM/YYYY or YYYY-MM-DD"
+        in json.loads(row_insert["errors"])
+    )
 
 
 def test_observation_upload_stages_reading_without_prediction_work(import_client):

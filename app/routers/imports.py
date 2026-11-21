@@ -4,7 +4,7 @@ import hashlib
 import io
 import json
 import re
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from math import isfinite
 from uuid import UUID
 
@@ -103,6 +103,18 @@ def _parse_aware_datetime(value: str) -> datetime | None:
     return parsed
 
 
+def _normalize_birth_date(value: str) -> str:
+    if "/" in value:
+        parsed = datetime.strptime(value, "%d/%m/%Y").date()
+        if parsed.strftime("%d/%m/%Y") != value:
+            raise ValueError("birth_date must use DD/MM/YYYY")
+    else:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+        if parsed.isoformat() != value:
+            raise ValueError("birth_date must use YYYY-MM-DD")
+    return parsed.isoformat()
+
+
 def _validate_encounter_rows(
     records: list[dict],
     db: Session,
@@ -180,10 +192,10 @@ def _validate_encounter_rows(
         birth_date = (row.get("birth_date") or "").strip()
         if birth_date:
             try:
-                date.fromisoformat(birth_date)
+                birth_date = _normalize_birth_date(birth_date)
             except ValueError:
                 errors.append(
-                    "Invalid birth_date; use YYYY-MM-DD"
+                    "Invalid birth_date; use DD/MM/YYYY or YYYY-MM-DD"
                 )
 
         admitted_at = (row.get("admitted_at") or "").strip()
@@ -199,12 +211,14 @@ def _validate_encounter_rows(
             except ValueError:
                 errors.append("Invalid admitted_at")
 
+        payload = {
+            key: (row.get(key) or "").strip()
+            for key in IMPORT_COLUMNS[ImportTemplateKind.encounters]
+        }
+        payload["birth_date"] = birth_date
         staged_rows.append({
             "row_number": row_number,
-            "payload": {
-                key: (row.get(key) or "").strip()
-                for key in IMPORT_COLUMNS[ImportTemplateKind.encounters]
-            },
+            "payload": payload,
             "errors": errors,
         })
 

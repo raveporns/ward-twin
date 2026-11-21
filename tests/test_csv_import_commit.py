@@ -240,6 +240,94 @@ def test_observation_commit_inserts_group_and_measurements(commit_client):
     )
 
 
+def test_encounter_commit_uses_normalized_staged_birth_date():
+    import_id = uuid4()
+    job = {
+        "import_id": import_id,
+        "kind": "encounters",
+        "status": "validated",
+        "ward_id": "WARD-A",
+        "total_rows": 1,
+        "valid_rows": 1,
+        "error_rows": 0,
+    }
+    staged_payload = {
+        "patient_id": "PAT-TEST",
+        "hn": "HN-TEST",
+        "display_name": "Test Patient",
+        "birth_date": "2026-11-21",
+        "sex": "",
+        "encounter_id": "ENC-TEST",
+        "an": "",
+        "ward_id": "WARD-A",
+        "bed_label": "A-01",
+        "admitted_at": "2026-11-20T08:00:00+07:00",
+    }
+    statements = []
+    db = MagicMock()
+
+    def execute(statement, params=None):
+        sql = str(statement)
+        statements.append((sql, params or {}))
+        result = MagicMock()
+        if "FROM ward_twin.import_jobs" in sql and "FOR UPDATE" in sql:
+            result.mappings.return_value.first.return_value = job
+        elif "FROM ward_twin.import_rows" in sql:
+            result.mappings.return_value.all.return_value = [
+                {"payload": staged_payload}
+            ]
+        elif "SELECT 1" in sql and "FROM ward_twin.encounters" in sql:
+            result.first.return_value = None
+        elif "FROM ward_twin.patients" in sql:
+            result.mappings.return_value.all.return_value = []
+        return result
+
+    db.execute.side_effect = execute
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: {
+        "sub": "admin-import-test",
+        "role": "admin",
+        "wards": ["WARD-A"],
+        "token_type": "access",
+    }
+
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/api/v1/imports/{import_id}/commit"
+            )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert response.status_code == 200
+    patient_insert = next(
+        params for sql, params in statements
+        if "INSERT INTO ward_twin.patients" in sql
+    )
+    assert patient_insert["birth_date"] == "2026-11-21"
+
+
+def test_invalid_import_cannot_be_committed(commit_client):
+    client, db, job, statements, *_ = commit_client
+    job["kind"] = "encounters"
+    job["status"] = "invalid"
+    job["error_rows"] = 1
+
+    response = client.post(
+        f"/api/v1/imports/{IMPORT_ID}/commit"
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Import is not ready to commit"
+    assert not any(
+        "INSERT INTO ward_twin.patients" in sql
+        or "INSERT INTO ward_twin.encounters" in sql
+        for sql, _ in statements
+    )
+    db.rollback.assert_called_once()
+
+
 def test_observation_reimport_with_same_hash_is_idempotent(commit_client):
     client, db, _, statements, existing_hash, *_ = commit_client
     existing_hash["value"] = expected_content_hash()
